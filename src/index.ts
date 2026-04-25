@@ -207,8 +207,11 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "claude-4.5-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
   "claude-4.5-sonnet":       { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
   "claude-4.6-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+  "claude-4.6-opus-high":    { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
   "claude-4.6-opus-fast":    { input: 30, output: 150, cache: { read: 3, write: 37.5 } },
   "claude-4.6-sonnet":       { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+  "claude-4.6-sonnet-medium":{ input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+  "claude-4.7-opus":         { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
 
   // Cursor
   "composer-1":              { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
@@ -224,8 +227,8 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gemini-3.1-pro":          { input: 2, output: 12, cache: { read: 0.2, write: 0 } },
 
   // OpenAI
-  "gpt-5.5":                 { input: 3, output: 15, cache: { read: 0.3, write: 0 } },
-  "gpt-5.5-pro":             { input: 10, output: 30, cache: { read: 1, write: 0 } },
+  "gpt-5.5":                 { input: 5, output: 30, cache: { read: 0.5, write: 0 } },
+  "gpt-5.5-pro":             { input: 5, output: 30, cache: { read: 0.5, write: 0 } },
   "gpt-5":                   { input: 1.25, output: 10, cache: { read: 0.125, write: 0 } },
   "gpt-5-fast":              { input: 2.5, output: 20, cache: { read: 0.25, write: 0 } },
   "gpt-5-mini":              { input: 0.25, output: 2, cache: { read: 0.025, write: 0 } },
