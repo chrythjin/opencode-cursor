@@ -143,6 +143,11 @@ interface ActiveBridge {
   pendingExecs: PendingExec[];
 }
 
+interface ActiveBridgeMatch {
+  key: string;
+  active: ActiveBridge;
+}
+
 // Active bridges keyed by a session token (derived from conversation state).
 // When tool_calls are returned, the bridge stays alive. The next request
 // with tool results looks up the bridge and sends mcpResult messages.
@@ -223,6 +228,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
   };
+  const bufferedData: Buffer[] = [];
 
   // Track exit state so late onClose registrations fire immediately.
   let exited = false;
@@ -243,7 +249,9 @@ function spawnBridge(options: SpawnBridgeOptions): {
           if (pending.length < 4 + len) break;
           const payload = pending.subarray(4, 4 + len);
           pending = pending.subarray(4 + len);
-          cbs.data?.(Buffer.from(payload));
+          const chunk = Buffer.from(payload);
+          if (cbs.data) cbs.data(chunk);
+          else bufferedData.push(chunk);
         }
       }
     } catch {
@@ -268,7 +276,12 @@ function spawnBridge(options: SpawnBridgeOptions): {
         proc.stdin.end();
       } catch {}
     },
-    onData(cb) { cbs.data = cb; },
+    onData(cb) {
+      cbs.data = cb;
+      while (bufferedData.length > 0) {
+        cb(bufferedData.shift()!);
+      }
+    },
     onClose(cb) {
       if (exited) {
         // Process already exited — invoke immediately so streams don't hang.
@@ -456,14 +469,16 @@ function handleChatCompletion(
   // convKey: model-independent, for conversation state that survives model switches
   const bridgeKey = deriveBridgeKey(modelId, body.messages);
   const convKey = deriveConversationKey(body.messages);
-  const activeBridge = activeBridges.get(bridgeKey);
+  const activeBridgeMatch = findActiveBridge(bridgeKey, toolResults);
+  const activeBridge = activeBridgeMatch?.active;
+  const activeBridgeKey = activeBridgeMatch?.key ?? bridgeKey;
 
   if (activeBridge && toolResults.length > 0) {
-    activeBridges.delete(bridgeKey);
+    activeBridges.delete(activeBridgeKey);
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey);
+      return handleToolResultResume(activeBridge, toolResults, modelId, activeBridgeKey, convKey);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -508,6 +523,53 @@ function handleChatCompletion(
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+}
+
+function findActiveBridge(
+  bridgeKey: string,
+  toolResults: ToolResultInfo[],
+): ActiveBridgeMatch | undefined {
+  const exact = activeBridges.get(bridgeKey);
+  if (exact) return { key: bridgeKey, active: exact };
+  if (toolResults.length === 0) return undefined;
+
+  const fallbackKey = findActiveBridgeKeyByToolCallId(activeBridges, toolResults);
+  if (!fallbackKey) return undefined;
+  return { key: fallbackKey, active: activeBridges.get(fallbackKey)! };
+}
+
+function findActiveBridgeKeyByToolCallId(
+  bridges: ReadonlyMap<string, { pendingExecs: ReadonlyArray<{ toolCallId: string }> }>,
+  toolResults: ReadonlyArray<{ toolCallId: string }>,
+): string | undefined {
+  const toolCallIds = new Set(
+    toolResults
+      .map((result) => result.toolCallId)
+      .filter((toolCallId) => toolCallId.length > 0),
+  );
+  if (toolCallIds.size === 0) return undefined;
+
+  for (const [key, active] of bridges) {
+    if (active.pendingExecs.some((exec) => toolCallIds.has(exec.toolCallId))) {
+      return key;
+    }
+  }
+  return undefined;
+}
+
+export function __testFindActiveBridgeKeyByToolCallId(
+  bridges: ReadonlyArray<{ key: string; pendingToolCallIds: string[] }>,
+  toolCallIds: string[],
+): string | undefined {
+  return findActiveBridgeKeyByToolCallId(
+    new Map(
+      bridges.map((bridge) => [
+        bridge.key,
+        { pendingExecs: bridge.pendingToolCallIds.map((toolCallId) => ({ toolCallId })) },
+      ]),
+    ),
+    toolCallIds.map((toolCallId) => ({ toolCallId })),
+  );
 }
 
 interface ToolResultInfo {
@@ -1232,7 +1294,6 @@ function createBridgeStreamResponse(
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
-
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
           try {

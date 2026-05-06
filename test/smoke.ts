@@ -1,6 +1,7 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
+import type { ServerHttp2Stream } from "node:http2";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
@@ -14,6 +15,7 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  __testFindActiveBridgeKeyByToolCallId: typeof import("../src/proxy").__testFindActiveBridgeKeyByToolCallId;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -77,6 +79,14 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
   return frame;
 }
 
+function getAuthLoader(
+  hooks: Awaited<ReturnType<TestModules["CursorAuthPlugin"]>>,
+): NonNullable<NonNullable<typeof hooks.auth>["loader"]> {
+  assert(hooks.auth, "Expected Cursor auth hooks to be registered");
+  assert(hooks.auth.loader, "Expected Cursor auth loader to be registered");
+  return hooks.auth.loader;
+}
+
 function decodeConnectStreamingMessages(payload: Uint8Array): Uint8Array[] {
   const messages: Uint8Array[] = [];
   let offset = 0;
@@ -120,7 +130,6 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
   const runRequests: ObservedRunRequest[] = [];
-
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
       res.writeHead(404);
@@ -150,6 +159,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 
   const apiServer = http2.createServer();
   apiServer.on("stream", (stream, headers) => {
+    const serverStream = stream as ServerHttp2Stream;
     const path = String(headers[":path"] ?? "");
     const authHeader = String(headers.authorization ?? "");
     const chunks: Buffer[] = [];
@@ -164,7 +174,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         if (observed) runRequests.push(observed);
         if (!stream.destroyed) {
           try {
-            stream.respond({
+            serverStream.respond({
               ":status": 200,
               "content-type": "application/connect+proto",
             });
@@ -183,7 +193,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
 
         if (discoveryMode === "auth-error") {
-          stream.respond({
+          serverStream.respond({
             ":status": 401,
             "content-type": "application/json",
           });
@@ -211,7 +221,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                 }),
               ),
             );
-        stream.respond({
+        serverStream.respond({
           ":status": 200,
           "content-type": "application/connect+proto",
         });
@@ -219,7 +229,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         return;
       }
 
-      stream.respond({ ":status": 404 });
+      serverStream.respond({ ":status": 404 });
       stream.end();
     });
   });
@@ -275,6 +285,7 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -529,6 +540,24 @@ async function testAutoModelSendsCursorDefaultModel(
   console.log("[test] Auto model request encoding OK");
 }
 
+async function testToolResultContinuationFallsBackToToolCallId(
+  modules: TestModules,
+) {
+  console.log("[test] Testing tool-result continuation fallback...");
+  assertEqual(
+    modules.__testFindActiveBridgeKeyByToolCallId(
+      [
+        { key: "bridge:auto:first-user", pendingToolCallIds: ["tool-call-1"] },
+        { key: "bridge:auto:other-user", pendingToolCallIds: ["tool-call-2"] },
+      ],
+      ["tool-call-1"],
+    ),
+    "bridge:auto:first-user",
+    "Expected tool result to find the original bridge by matching tool_call_id",
+  );
+  console.log("[test] Tool-result continuation fallback OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -560,7 +589,7 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   } as any);
   const provider = { models: {} as Record<string, unknown> } as any;
 
-  await hooks.auth!.loader(async () => authState, provider);
+  await getAuthLoader(hooks)(async () => authState, provider);
 
   assertEqual(writes.length, 1, "Expected refreshed auth to be persisted once");
   assert(
@@ -609,7 +638,7 @@ async function testDiscoveryFallbackAndSuccess(
   // Failed discovery should fall back to hardcoded models
   modules.clearModelCache();
   backend.setDiscoveryMode("empty");
-  const degradedConfig = await hooks.auth!.loader(async () => authState, provider);
+  const degradedConfig = await getAuthLoader(hooks)(async () => authState, provider);
   assert(
     Object.keys(provider.models).length > 0,
     "Expected fallback models to be registered when discovery fails",
@@ -638,7 +667,7 @@ async function testDiscoveryFallbackAndSuccess(
     { id: "auto", name: "Auto From Discovery", reasoning: true },
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
-  const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
+  const discoveredConfig = await getAuthLoader(hooks)(async () => authState, provider);
   assert(
     "auto" in provider.models,
     "Expected successful discovery provider models to include auto",
@@ -680,6 +709,7 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testAutoModelSendsCursorDefaultModel(modules, backend);
+    await testToolResultContinuationFallsBackToToolCallId(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");
