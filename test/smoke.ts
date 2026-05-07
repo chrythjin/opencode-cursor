@@ -5,7 +5,10 @@ import type { ServerHttp2Stream } from "node:http2";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
+  AgentServerMessageSchema,
+  ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
 
@@ -17,6 +20,7 @@ interface TestModules {
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   __testFindActiveBridgeKeyByToolCallId: typeof import("../src/proxy").__testFindActiveBridgeKeyByToolCallId;
   __testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
+  __testEmitToolCallsFromConnectFrames: typeof import("../src/proxy").__testEmitToolCallsFromConnectFrames;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -78,6 +82,34 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
   frame.writeUInt32BE(payload.length, 1);
   frame.set(payload, 5);
   return frame;
+}
+
+function frameConnectEndStream(): Buffer {
+  const payload = new TextEncoder().encode("{}");
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = 0b0000_0010;
+  frame.writeUInt32BE(payload.length, 1);
+  frame.set(payload, 5);
+  return frame;
+}
+
+function makeMcpExecFrame(id: number, toolCallId: string, toolName: string): Buffer {
+  const mcpArgs = create(McpArgsSchema, {
+    name: toolName,
+    toolName,
+    toolCallId,
+    providerIdentifier: "opencode",
+    args: {},
+  });
+  const execMessage = create(ExecServerMessageSchema, {
+    id,
+    execId: `exec-${id}`,
+    message: { case: "mcpArgs", value: mcpArgs },
+  });
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: { case: "execServerMessage", value: execMessage },
+  });
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
 }
 
 function getAuthLoader(
@@ -288,6 +320,7 @@ async function loadModules(): Promise<TestModules> {
     getProxyPort: proxy.getProxyPort,
     __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
     __testCreateActiveBridgeKey: proxy.__testCreateActiveBridgeKey,
+    __testEmitToolCallsFromConnectFrames: proxy.__testEmitToolCallsFromConnectFrames,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -605,6 +638,23 @@ async function testParallelAutoBridgeKeysDoNotCollide(
   console.log("[test] Parallel AUTO bridge keys OK");
 }
 
+async function testStreamingResponseEmitsAllMcpArgs(
+  modules: TestModules,
+) {
+  console.log("[test] Testing multi-tool stream frame handling...");
+  const toolCallIds = modules.__testEmitToolCallsFromConnectFrames([
+    makeMcpExecFrame(1, "tool-call-a", "first_tool"),
+    makeMcpExecFrame(2, "tool-call-b", "second_tool"),
+    frameConnectEndStream(),
+  ]);
+  assertArrayEqual(
+    toolCallIds,
+    ["tool-call-a", "tool-call-b"],
+    "Expected all mcpArgs frames to become pending tool calls before finishing",
+  );
+  console.log("[test] Multi-tool stream frame handling OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -758,6 +808,7 @@ async function main() {
     await testAutoModelSendsCursorDefaultModel(modules, backend);
     await testToolResultContinuationFallsBackToToolCallId(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
+    await testStreamingResponseEmitsAllMcpArgs(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

@@ -1308,6 +1308,7 @@ function createBridgeStreamResponse(
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      let toolCallFinishScheduled = false;
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
           try {
@@ -1361,9 +1362,14 @@ function createBridgeStreamResponse(
                   pendingExecs: state.pendingExecs,
                 });
 
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
+                if (!toolCallFinishScheduled) {
+                  toolCallFinishScheduled = true;
+                  queueMicrotask(() => {
+                    sendSSE(makeChunk({}, "tool_calls"));
+                    sendDone();
+                    closeController();
+                  });
+                }
               },
               (checkpointBytes) => {
                 const stored = conversationStates.get(convKey);
@@ -1425,6 +1431,39 @@ function createBridgeStreamResponse(
   });
 
   return new Response(stream, { headers: SSE_HEADERS });
+}
+
+export function __testEmitToolCallsFromConnectFrames(frames: Uint8Array[]): string[] {
+  const emittedToolCallIds: string[] = [];
+  const bridge = {
+    write: (_data: Uint8Array) => {},
+  };
+  const state: StreamState = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+  };
+  const processChunk = createConnectFrameParser(
+    (messageBytes) => {
+      const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+      processServerMessage(
+        serverMessage,
+        new Map(),
+        [],
+        (data) => bridge.write(data),
+        state,
+        () => {},
+        (exec) => {
+          state.pendingExecs.push(exec);
+          emittedToolCallIds.push(exec.toolCallId);
+        },
+      );
+    },
+    () => {},
+  );
+  for (const frame of frames) processChunk(Buffer.from(frame));
+  return emittedToolCallIds;
 }
 
 /** Spawn a bridge, send the initial request frame, and start heartbeat. */

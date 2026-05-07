@@ -22,6 +22,20 @@ import http2 from "node:http2";
 import crypto from "node:crypto";
 
 const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+const INITIAL_TIMEOUT_MS = readPositiveTimeout(
+  process.env.CURSOR_BRIDGE_INITIAL_TIMEOUT_MS,
+  30_000,
+);
+const INACTIVITY_TIMEOUT_MS = readPositiveTimeout(
+  process.env.CURSOR_BRIDGE_INACTIVITY_TIMEOUT_MS,
+  600_000,
+);
+
+function readPositiveTimeout(value, fallback) {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {
@@ -89,11 +103,11 @@ const client = http2.connect(url || "https://api2.cursor.sh");
 
 // Guard against initial connection failure. Reset on any h2 activity
 // so long-running agent conversations (with tool call round-trips) survive.
-let timeout = setTimeout(killBridge, 30_000);
+let timeout = setTimeout(killBridge, INITIAL_TIMEOUT_MS);
 
 function resetTimeout() {
   clearTimeout(timeout);
-  timeout = setTimeout(killBridge, 120_000);
+  timeout = setTimeout(killBridge, INACTIVITY_TIMEOUT_MS);
 }
 
 function killBridge() {

@@ -53,6 +53,10 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 HTTP/2 transport runs through a Node child process (`h2-bridge.mjs`) because
 Bun's `node:http2` support is not reliable against Cursor's API.
 
+`CURSOR_BRIDGE_INACTIVITY_TIMEOUT_MS` can override the bridge inactivity guard.
+The default is 10 minutes so long OpenCode tool calls can return before the
+paused Cursor stream is killed.
+
 ## Architecture
 
 ```

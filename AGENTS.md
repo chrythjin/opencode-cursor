@@ -46,6 +46,7 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy, src/proxy.ts)
 - **Token expiry**: 5-minute safety margin subtracted from JWT `exp`. Auth refresh happens automatically before expiry.
 - **`CURSOR_API_URL`** env var overrides `https://api2.cursor.sh` for testing.
 - **`CURSOR_REFRESH_URL`** env var overrides the token refresh endpoint.
+- **`CURSOR_BRIDGE_INACTIVITY_TIMEOUT_MS`** env var controls the H2 bridge inactivity guard; default is 10 minutes so long subagent tool runs do not kill the bridge at 2 minutes.
 
 ## Auto Model Routing
 
