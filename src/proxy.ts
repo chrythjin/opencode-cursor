@@ -148,9 +148,12 @@ interface ActiveBridgeMatch {
   active: ActiveBridge;
 }
 
-// Active bridges keyed by a session token (derived from conversation state).
+// Active bridges keyed by a per-request token.
 // When tool_calls are returned, the bridge stays alive. The next request
-// with tool results looks up the bridge and sends mcpResult messages.
+// with tool results primarily looks up the bridge by tool_call_id and sends
+// mcpResult messages. The key must not be derived only from model/prompt text:
+// parallel AUTO/subagent calls often share those values and would overwrite
+// each other's paused bridges.
 const activeBridges = new Map<string, ActiveBridge>();
 
 interface StoredConversation {
@@ -465,13 +468,13 @@ function handleChatCompletion(
     );
   }
 
-  // bridgeKey: model-specific, for active tool-call bridges
+  // bridgeLookupKey: model-specific legacy lookup hint for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
+  const bridgeLookupKey = deriveBridgeKey(modelId, body.messages);
   const convKey = deriveConversationKey(body.messages);
-  const activeBridgeMatch = findActiveBridge(bridgeKey, toolResults);
+  const activeBridgeMatch = findActiveBridge(bridgeLookupKey, toolResults);
   const activeBridge = activeBridgeMatch?.active;
-  const activeBridgeKey = activeBridgeMatch?.key ?? bridgeKey;
+  const activeBridgeKey = activeBridgeMatch?.key ?? createActiveBridgeKey(bridgeLookupKey);
 
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(activeBridgeKey);
@@ -488,10 +491,10 @@ function handleChatCompletion(
   }
 
   // Clean up stale bridge if present
-  if (activeBridge && activeBridges.has(bridgeKey)) {
+  if (activeBridge && activeBridges.has(activeBridgeKey)) {
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    activeBridges.delete(activeBridgeKey);
   }
 
   let stored = conversationStates.get(convKey);
@@ -522,7 +525,7 @@ function handleChatCompletion(
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+  return handleStreamingResponse(payload, accessToken, modelId, activeBridgeKey, convKey);
 }
 
 function findActiveBridge(
@@ -542,19 +545,26 @@ function findActiveBridgeKeyByToolCallId(
   bridges: ReadonlyMap<string, { pendingExecs: ReadonlyArray<{ toolCallId: string }> }>,
   toolResults: ReadonlyArray<{ toolCallId: string }>,
 ): string | undefined {
-  const toolCallIds = new Set(
+  const toolCallIds = [
+    ...new Set(
     toolResults
       .map((result) => result.toolCallId)
       .filter((toolCallId) => toolCallId.length > 0),
-  );
-  if (toolCallIds.size === 0) return undefined;
+    ),
+  ];
+  if (toolCallIds.length === 0) return undefined;
 
   for (const [key, active] of bridges) {
-    if (active.pendingExecs.some((exec) => toolCallIds.has(exec.toolCallId))) {
+    const pendingToolCallIds = new Set(active.pendingExecs.map((exec) => exec.toolCallId));
+    if (toolCallIds.every((toolCallId) => pendingToolCallIds.has(toolCallId))) {
       return key;
     }
   }
   return undefined;
+}
+
+function createActiveBridgeKey(lookupKey: string): string {
+  return `${lookupKey}:${crypto.randomUUID()}`;
 }
 
 export function __testFindActiveBridgeKeyByToolCallId(
@@ -570,6 +580,10 @@ export function __testFindActiveBridgeKeyByToolCallId(
     ),
     toolCallIds.map((toolCallId) => ({ toolCallId })),
   );
+}
+
+export function __testCreateActiveBridgeKey(lookupKey: string): string {
+  return createActiveBridgeKey(lookupKey);
 }
 
 interface ToolResultInfo {

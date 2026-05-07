@@ -16,6 +16,7 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   __testFindActiveBridgeKeyByToolCallId: typeof import("../src/proxy").__testFindActiveBridgeKeyByToolCallId;
+  __testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -286,6 +287,7 @@ async function loadModules(): Promise<TestModules> {
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
+    __testCreateActiveBridgeKey: proxy.__testCreateActiveBridgeKey,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -558,6 +560,51 @@ async function testToolResultContinuationFallsBackToToolCallId(
   console.log("[test] Tool-result continuation fallback OK");
 }
 
+async function testParallelAutoBridgeKeysDoNotCollide(
+  modules: TestModules,
+) {
+  console.log("[test] Testing parallel AUTO bridge keys...");
+  const lookupKey = "bridge:auto:first-user";
+  const firstKey = modules.__testCreateActiveBridgeKey(lookupKey);
+  const secondKey = modules.__testCreateActiveBridgeKey(lookupKey);
+
+  assert(
+    firstKey.startsWith(`${lookupKey}:`),
+    "Expected active bridge key to retain the legacy lookup prefix for diagnostics",
+  );
+  assert(
+    secondKey.startsWith(`${lookupKey}:`),
+    "Expected active bridge key to retain the legacy lookup prefix for diagnostics",
+  );
+  assert(
+    firstKey !== secondKey,
+    "Expected parallel AUTO bridge keys with the same lookup input to be unique",
+  );
+  assertEqual(
+    modules.__testFindActiveBridgeKeyByToolCallId(
+      [
+        { key: firstKey, pendingToolCallIds: ["tool-call-a"] },
+        { key: secondKey, pendingToolCallIds: ["tool-call-b"] },
+      ],
+      ["tool-call-a"],
+    ),
+    firstKey,
+    "Expected tool_call_id fallback to find the matching UUID-keyed bridge",
+  );
+  assertEqual(
+    modules.__testFindActiveBridgeKeyByToolCallId(
+      [
+        { key: firstKey, pendingToolCallIds: ["tool-call-a"] },
+        { key: secondKey, pendingToolCallIds: ["tool-call-b"] },
+      ],
+      ["tool-call-a", "tool-call-b"],
+    ),
+    undefined,
+    "Expected mixed tool results from parallel bridges not to match one bridge",
+  );
+  console.log("[test] Parallel AUTO bridge keys OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -710,6 +757,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testAutoModelSendsCursorDefaultModel(modules, backend);
     await testToolResultContinuationFallsBackToToolCallId(modules);
+    await testParallelAutoBridgeKeysDoNotCollide(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");
