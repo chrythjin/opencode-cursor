@@ -6,6 +6,7 @@
  * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Config, Model } from "@opencode-ai/sdk";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -32,6 +33,10 @@ export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
   return {
+    config: async (config: Config): Promise<void> => {
+      ensureCursorProviderConfig(config);
+    },
+
     auth: {
       provider: CURSOR_PROVIDER_ID,
 
@@ -81,7 +86,7 @@ export const CursorAuthPlugin: Plugin = async (
         }, models);
 
         if (provider) {
-          (provider as any).models = buildCursorProviderModels(models, port);
+          provider.models = buildCursorProviderModels(models, port);
         }
 
         return {
@@ -147,10 +152,45 @@ export const CursorAuthPlugin: Plugin = async (
   };
 };
 
+function ensureCursorProviderConfig(config: Config): void {
+  if (!config.provider) {
+    config.provider = {};
+  }
+
+  const providers = config.provider;
+  if (!providers[CURSOR_PROVIDER_ID]) {
+    providers[CURSOR_PROVIDER_ID] = {};
+  }
+
+  const cursor = providers[CURSOR_PROVIDER_ID];
+
+  cursor.name ??= "Cursor";
+  cursor.npm ??= "@ai-sdk/openai-compatible";
+  cursor.models ??= {};
+  cursor.models[CURSOR_AUTO_MODEL.id] ??= {
+    id: CURSOR_AUTO_MODEL.id,
+    name: CURSOR_AUTO_MODEL.name,
+    reasoning: CURSOR_AUTO_MODEL.reasoning,
+    temperature: true,
+    tool_call: true,
+    limit: {
+      context: CURSOR_AUTO_MODEL.contextWindow,
+      output: CURSOR_AUTO_MODEL.maxTokens,
+    },
+    modalities: {
+      input: ["text"],
+      output: ["text"],
+    },
+    provider: {
+      npm: "@ai-sdk/openai-compatible",
+    },
+  };
+}
+
 function buildCursorProviderModels(
   models: CursorModel[],
   port: number,
-): Record<string, any> {
+): Record<string, Model> {
   const providerModels = mergeAutoModel(models);
 
   return Object.fromEntries(
