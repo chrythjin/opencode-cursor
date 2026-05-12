@@ -8,6 +8,7 @@ import {
   AgentRunRequestSchema,
   AgentServerMessageSchema,
   AskQuestionInteractionQuerySchema,
+  ConversationStateStructureSchema,
   ExecServerMessageSchema,
   InteractionUpdateSchema,
   InteractionQuerySchema,
@@ -26,6 +27,7 @@ interface TestModules {
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   __testFindActiveBridgeKeyByToolCallId: typeof import("../src/proxy").__testFindActiveBridgeKeyByToolCallId;
   __testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
+  __testBuildPayloadFromOpenAiMessages: typeof import("../src/proxy").__testBuildPayloadFromOpenAiMessages;
   __testEmitToolCallsFromConnectFrames: typeof import("../src/proxy").__testEmitToolCallsFromConnectFrames;
   __testStreamToolCallsFromConnectFrames: typeof import("../src/proxy").__testStreamToolCallsFromConnectFrames;
   __testInteractionResponseFromQueryFrame: typeof import("../src/proxy").__testInteractionResponseFromQueryFrame;
@@ -49,6 +51,7 @@ interface ObservedRunRequest {
 interface TestCursorBackend {
   apiUrl: string;
   refreshUrl: string;
+  queueRunFrames: (frames: Uint8Array[]) => void;
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
   resetObservations: () => void;
@@ -174,6 +177,27 @@ function makeTurnEndedFrame(): Buffer {
   return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
 }
 
+function makeCheckpointFrame(): Buffer {
+  const checkpoint = create(ConversationStateStructureSchema, {
+    rootPromptMessagesJson: [],
+    turns: [],
+    todos: [],
+    pendingToolCalls: [],
+    previousWorkspaceUris: [],
+    fileStates: {},
+    fileStatesV2: {},
+    summaryArchives: [],
+    turnTimings: [],
+    subagentStates: {},
+    selfSummaryCount: 0,
+    readPaths: [],
+  });
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: { case: "conversationCheckpointUpdate", value: checkpoint },
+  });
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
+}
+
 function getAuthLoader(
   hooks: Awaited<ReturnType<TestModules["CursorAuthPlugin"]>>,
 ): NonNullable<NonNullable<typeof hooks.auth>["loader"]> {
@@ -235,6 +259,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
   const runRequests: ObservedRunRequest[] = [];
+  const queuedRunFrames: Uint8Array[][] = [];
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
       res.writeHead(404);
@@ -283,6 +308,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
               ":status": 200,
               "content-type": "application/connect+proto",
             });
+            const frames = queuedRunFrames.shift();
+            if (frames) {
+              for (const frame of frames) stream.write(frame);
+            }
             stream.end();
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ERR_HTTP2_INVALID_STREAM") {
@@ -344,6 +373,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   return {
     apiUrl: `http://127.0.0.1:${apiPort}`,
     refreshUrl: `http://127.0.0.1:${refreshPort}/auth/exchange_user_api_key`,
+    queueRunFrames(frames) {
+      queuedRunFrames.push(frames);
+    },
     setDiscoveryMode(mode) {
       discoveryMode = mode;
     },
@@ -392,6 +424,7 @@ async function loadModules(): Promise<TestModules> {
     getProxyPort: proxy.getProxyPort,
     __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
     __testCreateActiveBridgeKey: proxy.__testCreateActiveBridgeKey,
+    __testBuildPayloadFromOpenAiMessages: proxy.__testBuildPayloadFromOpenAiMessages,
     __testEmitToolCallsFromConnectFrames: proxy.__testEmitToolCallsFromConnectFrames,
     __testStreamToolCallsFromConnectFrames: proxy.__testStreamToolCallsFromConnectFrames,
     __testInteractionResponseFromQueryFrame: proxy.__testInteractionResponseFromQueryFrame,
@@ -709,6 +742,43 @@ async function testFollowUpUserMessageBecomesCursorAction(
 
   modules.stopProxy();
   console.log("[test] follow-up user message action parsing OK");
+}
+
+async function testFollowUpIgnoresStoredCheckpoint(
+  modules: TestModules,
+) {
+  console.log("[test] Testing follow-up ignores stored checkpoint...");
+  const requestBytes = modules.__testBuildPayloadFromOpenAiMessages(
+    "auto",
+    [
+      { role: "user", content: "checkpoint follow-up first" },
+      { role: "assistant", content: "first answer" },
+      { role: "user", content: "checkpoint follow-up second" },
+    ],
+    "00000000-0000-4000-8000-000000000000",
+  );
+  const clientMessage = fromBinary(AgentClientMessageSchema, requestBytes);
+  const runRequest = clientMessage.message.case === "runRequest"
+    ? clientMessage.message.value
+    : undefined;
+  assert(runRequest, "Expected helper to build a runRequest");
+  const decodedRunRequest = fromBinary(
+    AgentRunRequestSchema,
+    toBinary(AgentRunRequestSchema, runRequest),
+  );
+  const action = decodedRunRequest.action?.action;
+  assertEqual(
+    action?.case === "userMessageAction" ? action.value.userMessage?.text : undefined,
+    "checkpoint follow-up second",
+    "Expected the latest user message to remain the Cursor action after a stored checkpoint",
+  );
+  assertEqual(
+    decodedRunRequest.conversationState?.turns.length ?? 0,
+    1,
+    "Expected OpenAI history to be rebuilt instead of replaced by the stored checkpoint",
+  );
+
+  console.log("[test] follow-up checkpoint rebuild OK");
 }
 
 async function testToolResultContinuationFallsBackToToolCallId(
@@ -1053,6 +1123,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testAutoModelSendsCursorDefaultModel(modules, backend);
     await testFollowUpUserMessageBecomesCursorAction(modules, backend);
+    await testFollowUpIgnoresStoredCheckpoint(modules);
     await testToolResultContinuationFallsBackToToolCallId(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
   await testStreamingResponseEmitsAllMcpArgs(modules);

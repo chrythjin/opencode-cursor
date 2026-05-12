@@ -536,15 +536,9 @@ function handleChatCompletion(
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
-  // Build the request. When tool results are present but the bridge died,
-  // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
-  const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
-    stored.conversationId, stored.checkpoint, stored.blobStore,
+  const payload = buildPayloadFromOpenAiMessages(
+    modelId, systemPrompt, userText, turns, toolResults, stored.conversationId,
   );
   payload.mcpTools = mcpTools;
 
@@ -552,6 +546,28 @@ function handleChatCompletion(
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
   return handleStreamingResponse(payload, accessToken, modelId, activeBridgeKey, convKey);
+}
+
+function buildPayloadFromOpenAiMessages(
+  modelId: string,
+  systemPrompt: string,
+  userText: string,
+  turns: Array<{ userText: string; assistantText: string }>,
+  toolResults: ToolResultInfo[],
+  conversationId: string,
+): CursorRequestPayload {
+  // Build the request from OpenAI's authoritative messages each time. Stored
+  // Cursor checkpoints are intentionally not reused here because chat
+  // completions requests are stateless and already include the transcript.
+  // Reinjecting a prior Cursor checkpoint can replace the follow-up history and
+  // leave Cursor waiting on inconsistent turn/blob state.
+  const effectiveUserText = userText || (toolResults.length > 0
+    ? toolResults.map((r) => r.content).join("\n")
+    : "");
+  return buildCursorRequest(
+    modelId, systemPrompt, effectiveUserText, turns,
+    conversationId, null, undefined,
+  );
 }
 
 function findActiveBridge(
@@ -612,6 +628,17 @@ export function __testFindActiveBridgeKeyByToolCallId(
 
 export function __testCreateActiveBridgeKey(lookupKey: string): string {
   return createActiveBridgeKey(lookupKey);
+}
+
+export function __testBuildPayloadFromOpenAiMessages(
+  modelId: string,
+  messages: OpenAIMessage[],
+  conversationId: string,
+): Uint8Array {
+  const { systemPrompt, userText, turns, toolResults } = parseMessages(messages);
+  return buildPayloadFromOpenAiMessages(
+    modelId, systemPrompt, userText, turns, toolResults, conversationId,
+  ).requestBytes;
 }
 
 interface ToolResultInfo {

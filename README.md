@@ -92,6 +92,35 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
 ```sh
 bun install
 bun run build
+
+```
+OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
+                                              |
+                                    Node child process (h2-bridge.mjs)
+                                              |
+                                     HTTP/2 Connect stream
+                                              |
+                                    api2.cursor.sh gRPC
+                                      /agent.v1.AgentService/Run
+```
+
+### Tool call flow
+
+```
+1. Cursor model receives OpenAI tools via RequestContext (as MCP tool defs)
+2. Model tries native tools (readArgs, shellArgs, etc.)
+3. Proxy rejects each with typed error (ReadRejected, ShellRejected, etc.)
+4. Model falls back to MCP tool -> mcpArgs exec message
+5. Proxy emits OpenAI tool_calls SSE chunk, pauses H2 stream
+6. OpenCode executes tool, sends result in follow-up request
+7. Proxy resumes H2 stream with mcpResult, streams continuation
+```
+
+## Develop locally
+
+```sh
+bun install
+bun run build
 bun test/smoke.ts
 ```
 
@@ -101,3 +130,39 @@ bun test/smoke.ts
 - [Bun](https://bun.sh)
 - [Node.js](https://nodejs.org) >= 18 for the HTTP/2 bridge process
 - Active [Cursor](https://cursor.com) subscription
+
+## Enabling Model Variants for Custom Providers (like openai-oauth)
+
+If you are using a custom OpenAI-compatible provider (e.g., `openai-oauth`) and notice that the model variants (like `high` or `low` reasoning effort) do not appear next to the model name in the OpenCode TUI, you can enable them by explicitly setting `"reasoning": true` in your `opencode.json` file.
+
+OpenCode's internal logic will automatically generate and display the standard/high/low reasoning variants if the model's capabilities include reasoning.
+
+### Example configuration (`~/.config/opencode/opencode.json`)
+
+```jsonc
+{
+  "provider": {
+    "openai-oauth": {
+      "name": "openai-oauth",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:10531/v1",
+        "apiKey": "oauth"
+      },
+      "models": {
+        "gpt-5.5": {
+          "name": "gpt-5.5",
+          "reasoning": true, // <--- Add this flag to enable reasoning capabilities
+          "variants": {      // <--- (Optional) Define your own custom variant names
+            "standard": {},
+            "high": { "body": { "reasoning_effort": "high" } },
+            "low": { "body": { "reasoning_effort": "low" } }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+After modifying the configuration, you **must completely restart OpenCode** for the new configuration to be applied and the variants to appear in the TUI state bar.
