@@ -152,7 +152,7 @@ interface PendingExec {
 
 /** A bridge kept alive across requests for tool result continuation. */
 interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+  bridge: Pick<ReturnType<typeof spawnBridge>, "write" | "end" | "onData" | "onClose" | "alive">;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
@@ -959,6 +959,7 @@ function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   onBlobSet?: (blobIdKey: string, blobData: Uint8Array) => void,
+  onTurnEnded?: () => void,
 ): void {
   const msgCase = msg.message.case;
   if (process.env.DEBUG_PROXY) {
@@ -966,7 +967,7 @@ function processServerMessage(
   }
 
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, state, onText);
+    handleInteractionUpdate(msg.message.value, state, onText, onTurnEnded);
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame, onBlobSet);
   } else if (msgCase === "execServerMessage") {
@@ -1097,6 +1098,7 @@ function handleInteractionUpdate(
   update: any,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
+  onTurnEnded?: () => void,
 ): void {
   const updateCase = update.message?.case;
 
@@ -1108,6 +1110,8 @@ function handleInteractionUpdate(
     if (delta) onText(delta, true);
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === "turnEnded") {
+    onTurnEnded?.();
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
@@ -1374,7 +1378,7 @@ function deterministicConversationId(convKey: string): string {
 
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: Pick<ReturnType<typeof spawnBridge>, "write" | "end" | "onData" | "onClose" | "alive">,
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1426,6 +1430,7 @@ function createBridgeStreamResponse(
         };
       };
       const finishStream = (finishReason: string, endBridge = false) => {
+        if (closed) return;
         const flushed = tagFilter.flush();
         if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
         if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
@@ -1504,8 +1509,11 @@ function createBridgeStreamResponse(
 
                 if (!toolCallFinishScheduled) {
                   toolCallFinishScheduled = true;
-                  // Don't close here — wait for bridge onClose to finalize.
-                  // This ensures all tool calls in this turn are captured.
+                  queueMicrotask(() => {
+                    if (activeBridges.has(bridgeKey)) {
+                      finishStream("tool_calls");
+                    }
+                  });
                 }
               },
               (checkpointBytes) => {
@@ -1522,6 +1530,11 @@ function createBridgeStreamResponse(
                   stored.lastAccessMs = Date.now();
                 }
               },
+              () => {
+                if (!mcpExecReceived) {
+                  finishStream("stop", true);
+                }
+              },
             );
           } catch {
             // Skip unparseable messages
@@ -1531,6 +1544,8 @@ function createBridgeStreamResponse(
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+            activeBridges.delete(bridgeKey);
+            finishStream("stop", true);
           } else if (!mcpExecReceived) {
             finishStream("stop", true);
           } else if (activeBridges.has(bridgeKey)) {
@@ -1541,7 +1556,7 @@ function createBridgeStreamResponse(
 
       bridge.onData(processChunk);
 
-      bridge.onClose((code) => {
+      bridge.onClose(() => {
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -1630,6 +1645,47 @@ export function __testEmitToolCallsFromConnectFrames(frames: Uint8Array[]): stri
   );
   for (const frame of frames) processChunk(Buffer.from(frame));
   return emittedToolCallIds;
+}
+
+export async function __testStreamToolCallsFromConnectFrames(frames: Uint8Array[]): Promise<string> {
+  const bridgeCallbacks: {
+    data?: (chunk: Buffer) => void;
+    close?: (code: number) => void;
+  } = {};
+  const bridge = {
+    write: (_data: Uint8Array) => {},
+    end: () => {},
+    onData: (cb: (chunk: Buffer) => void) => { bridgeCallbacks.data = cb; },
+    onClose: (cb: (code: number) => void) => { bridgeCallbacks.close = cb; },
+    get alive() { return true; },
+  };
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  const bridgeKey = createActiveBridgeKey("test-auto-tool-stream");
+  const response = createBridgeStreamResponse(
+    bridge,
+    heartbeatTimer,
+    new Map(),
+    [],
+    "auto",
+    bridgeKey,
+    "test-auto-conversation",
+  );
+  const reader = response.body!.getReader();
+  for (const frame of frames) bridgeCallbacks.data?.(Buffer.from(frame));
+  await Promise.resolve();
+
+  const chunks: string[] = [];
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(new TextDecoder().decode(value));
+    }
+    return chunks.join("");
+  } finally {
+    clearInterval(heartbeatTimer);
+    activeBridges.delete(bridgeKey);
+  }
 }
 
 /** Spawn a bridge, send the initial request frame, and start heartbeat. */
@@ -1765,9 +1821,11 @@ async function collectFullResponse(
   convKey: string,
 ): Promise<CollectedResponse> {
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
+  let resolved = false;
   let fullText = "";
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+  bridge.end();
 
   const state: StreamState = {
     toolCallIndex: 0,
@@ -1776,6 +1834,24 @@ async function collectFullResponse(
     totalTokens: 0,
   };
   const tagFilter = createThinkingTagFilter();
+  const finish = () => {
+    if (resolved) return;
+    resolved = true;
+    clearInterval(heartbeatTimer);
+    const stored = conversationStates.get(convKey);
+    if (stored) {
+      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+      stored.lastAccessMs = Date.now();
+    }
+    const flushed = tagFilter.flush();
+    fullText += flushed.content;
+
+    const usage = computeUsage(state);
+    resolve({
+      text: fullText,
+      usage,
+    });
+  };
 
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
@@ -1815,24 +1891,16 @@ async function collectFullResponse(
         // Skip
       }
     },
-    () => {},
+    (endStreamBytes) => {
+      const endError = parseConnectEndStream(endStreamBytes);
+      if (endError) fullText += `\n[Error: ${endError.message}]`;
+      finish();
+      bridge.end();
+    },
   ));
 
   bridge.onClose(() => {
-    clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-    }
-    const flushed = tagFilter.flush();
-    fullText += flushed.content;
-
-    const usage = computeUsage(state);
-    resolve({
-      text: fullText,
-      usage,
-    });
+    finish();
   });
 
   return promise;

@@ -8,10 +8,13 @@ import {
   AgentServerMessageSchema,
   AskQuestionInteractionQuerySchema,
   ExecServerMessageSchema,
+  InteractionUpdateSchema,
   InteractionQuerySchema,
   GetUsableModelsResponseSchema,
   McpArgsSchema,
   ModelDetailsSchema,
+  TextDeltaUpdateSchema,
+  TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
@@ -23,6 +26,7 @@ interface TestModules {
   __testFindActiveBridgeKeyByToolCallId: typeof import("../src/proxy").__testFindActiveBridgeKeyByToolCallId;
   __testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
   __testEmitToolCallsFromConnectFrames: typeof import("../src/proxy").__testEmitToolCallsFromConnectFrames;
+  __testStreamToolCallsFromConnectFrames: typeof import("../src/proxy").__testStreamToolCallsFromConnectFrames;
   __testInteractionResponseFromQueryFrame: typeof import("../src/proxy").__testInteractionResponseFromQueryFrame;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
@@ -97,6 +101,15 @@ function frameConnectEndStream(): Buffer {
   return frame;
 }
 
+function frameConnectEndStreamError(code: string, message: string): Buffer {
+  const payload = new TextEncoder().encode(JSON.stringify({ error: { code, message } }));
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = 0b0000_0010;
+  frame.writeUInt32BE(payload.length, 1);
+  frame.set(payload, 5);
+  return frame;
+}
+
 function makeAskQuestionInteractionQueryFrame(id: number): Buffer {
   const query = create(InteractionQuerySchema, {
     id,
@@ -128,6 +141,32 @@ function makeMcpExecFrame(id: number, toolCallId: string, toolName: string): Buf
   });
   const serverMessage = create(AgentServerMessageSchema, {
     message: { case: "execServerMessage", value: execMessage },
+  });
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
+}
+
+function makeTextDeltaFrame(text: string): Buffer {
+  const update = create(InteractionUpdateSchema, {
+    message: {
+      case: "textDelta",
+      value: create(TextDeltaUpdateSchema, { text }),
+    },
+  });
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: { case: "interactionUpdate", value: update },
+  });
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
+}
+
+function makeTurnEndedFrame(): Buffer {
+  const update = create(InteractionUpdateSchema, {
+    message: {
+      case: "turnEnded",
+      value: create(TurnEndedUpdateSchema, {}),
+    },
+  });
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: { case: "interactionUpdate", value: update },
   });
   return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
 }
@@ -342,6 +381,7 @@ async function loadModules(): Promise<TestModules> {
     __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
     __testCreateActiveBridgeKey: proxy.__testCreateActiveBridgeKey,
     __testEmitToolCallsFromConnectFrames: proxy.__testEmitToolCallsFromConnectFrames,
+    __testStreamToolCallsFromConnectFrames: proxy.__testStreamToolCallsFromConnectFrames,
     __testInteractionResponseFromQueryFrame: proxy.__testInteractionResponseFromQueryFrame,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
@@ -716,17 +756,73 @@ async function testStreamingResponseEmitsAllMcpArgs(
   modules: TestModules,
 ) {
   console.log("[test] Testing multi-tool stream frame handling...");
-  const toolCallIds = modules.__testEmitToolCallsFromConnectFrames([
+  const frames = [
     makeMcpExecFrame(1, "tool-call-a", "first_tool"),
     makeMcpExecFrame(2, "tool-call-b", "second_tool"),
     frameConnectEndStream(),
-  ]);
+  ];
+  const toolCallIds = modules.__testEmitToolCallsFromConnectFrames(frames);
   assertArrayEqual(
     toolCallIds,
     ["tool-call-a", "tool-call-b"],
     "Expected all mcpArgs frames to become pending tool calls before finishing",
   );
+
+  const sseText = await modules.__testStreamToolCallsFromConnectFrames(frames);
+  assert(
+    sseText.includes('"finish_reason":"tool_calls"'),
+    "Expected streaming tool-call response to finish with tool_calls",
+  );
+  assert(
+    sseText.includes("data: [DONE]"),
+    "Expected streaming tool-call response to close with [DONE]",
+  );
   console.log("[test] Multi-tool stream frame handling OK");
+}
+
+async function testStreamingResponseClosesOnConnectError(
+  modules: TestModules,
+) {
+  console.log("[test] Testing Connect error stream closure...");
+  const sseText = await modules.__testStreamToolCallsFromConnectFrames([
+    frameConnectEndStreamError("internal", "model stream failed"),
+  ]);
+  assert(
+    sseText.includes("Connect error internal: model stream failed"),
+    "Expected Connect end-stream error to be emitted to the client",
+  );
+  assert(
+    sseText.includes('"finish_reason":"stop"'),
+    "Expected Connect end-stream error to finish the SSE stream",
+  );
+  assert(
+    sseText.includes("data: [DONE]"),
+    "Expected Connect end-stream error response to close with [DONE]",
+  );
+  console.log("[test] Connect error stream closure OK");
+}
+
+async function testStreamingResponseClosesOnTurnEnded(
+  modules: TestModules,
+) {
+  console.log("[test] Testing turnEnded stream closure...");
+  const sseText = await modules.__testStreamToolCallsFromConnectFrames([
+    makeTextDeltaFrame("hello from cursor"),
+    makeTurnEndedFrame(),
+  ]);
+  assert(
+    sseText.includes("hello from cursor"),
+    "Expected text delta to be emitted before turnEnded closure",
+  );
+  assert(
+    sseText.includes('"finish_reason":"stop"'),
+    "Expected turnEnded update to finish the SSE stream",
+  );
+  assert(
+    sseText.includes("data: [DONE]"),
+    "Expected turnEnded response to close with [DONE]",
+  );
+  console.log("[test] turnEnded stream closure OK");
 }
 
 async function testExpiredTokenRefreshBeforeDiscovery(
@@ -883,6 +979,8 @@ async function main() {
     await testToolResultContinuationFallsBackToToolCallId(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
     await testStreamingResponseEmitsAllMcpArgs(modules);
+    await testStreamingResponseClosesOnConnectError(modules);
+    await testStreamingResponseClosesOnTurnEnded(modules);
     await testInteractionQueryIsRejected(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
