@@ -6,7 +6,9 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
   AgentServerMessageSchema,
+  AskQuestionInteractionQuerySchema,
   ExecServerMessageSchema,
+  InteractionQuerySchema,
   GetUsableModelsResponseSchema,
   McpArgsSchema,
   ModelDetailsSchema,
@@ -21,6 +23,7 @@ interface TestModules {
   __testFindActiveBridgeKeyByToolCallId: typeof import("../src/proxy").__testFindActiveBridgeKeyByToolCallId;
   __testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
   __testEmitToolCallsFromConnectFrames: typeof import("../src/proxy").__testEmitToolCallsFromConnectFrames;
+  __testInteractionResponseFromQueryFrame: typeof import("../src/proxy").__testInteractionResponseFromQueryFrame;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -29,6 +32,7 @@ interface TestModules {
 }
 
 interface ObservedRunRequest {
+  conversationId: string | undefined;
   modelId: string | undefined;
   requestedModelId: string | undefined;
   hasModelDetails: boolean;
@@ -93,6 +97,22 @@ function frameConnectEndStream(): Buffer {
   return frame;
 }
 
+function makeAskQuestionInteractionQueryFrame(id: number): Buffer {
+  const query = create(InteractionQuerySchema, {
+    id,
+    query: {
+      case: "askQuestionInteractionQuery",
+      value: create(AskQuestionInteractionQuerySchema, {
+        toolCallId: `interaction-tool-${id}`,
+      }),
+    },
+  });
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: { case: "interactionQuery", value: query },
+  });
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
+}
+
 function makeMcpExecFrame(id: number, toolCallId: string, toolName: string): Buffer {
   const mcpArgs = create(McpArgsSchema, {
     name: toolName,
@@ -147,6 +167,7 @@ function observeRunRequest(body: Uint8Array): ObservedRunRequest | null {
   if (clientMessage.message.case !== "runRequest") return null;
   const runRequest = clientMessage.message.value;
   return {
+    conversationId: runRequest.conversationId,
     modelId: runRequest.modelDetails?.modelId,
     requestedModelId: runRequest.requestedModel?.modelId,
     hasModelDetails: runRequest.modelDetails !== undefined,
@@ -321,6 +342,7 @@ async function loadModules(): Promise<TestModules> {
     __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
     __testCreateActiveBridgeKey: proxy.__testCreateActiveBridgeKey,
     __testEmitToolCallsFromConnectFrames: proxy.__testEmitToolCallsFromConnectFrames,
+    __testInteractionResponseFromQueryFrame: proxy.__testInteractionResponseFromQueryFrame,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -514,7 +536,7 @@ async function testAutoModelSendsCursorDefaultModel(
 ) {
   console.log("[test] Testing auto model request encoding...");
   backend.resetObservations();
-  const port = await modules.startProxy(async () => "test-token", [
+  let port = await modules.startProxy(async () => "test-token", [
     { id: "composer-2", name: "Composer 2" },
   ]);
 
@@ -538,7 +560,22 @@ async function testAutoModelSendsCursorDefaultModel(
     }),
   });
 
-  const [autoRequest, explicitRequest] = backend.getRunRequests();
+  modules.stopProxy();
+  port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "auto",
+      stream: false,
+      messages: [{ role: "user", content: "use automatic model selection" }],
+    }),
+  });
+
+  const [autoRequest, explicitRequest, restartedAutoRequest] = backend.getRunRequests();
   assert(autoRequest, "Expected auto model request to reach Cursor backend");
   assert(
     autoRequest.hasModelDetails,
@@ -558,6 +595,12 @@ async function testAutoModelSendsCursorDefaultModel(
     autoRequest.displayName,
     "Auto",
     "Expected auto model to display as Auto",
+  );
+  assert(restartedAutoRequest, "Expected restarted auto model request to reach Cursor backend");
+  assertEqual(
+    restartedAutoRequest.conversationId,
+    autoRequest.conversationId,
+    "Expected auto model conversationId to stay stable for the same first user prompt after proxy restart",
   );
   assert(explicitRequest, "Expected explicit model request to reach Cursor backend");
   assertEqual(
@@ -636,6 +679,37 @@ async function testParallelAutoBridgeKeysDoNotCollide(
     "Expected mixed tool results from parallel bridges not to match one bridge",
   );
   console.log("[test] Parallel AUTO bridge keys OK");
+}
+
+async function testInteractionQueryIsRejected(
+  modules: TestModules,
+) {
+  console.log("[test] Testing interactionQuery rejection response...");
+  const [responseFrame] = modules.__testInteractionResponseFromQueryFrame(
+    makeAskQuestionInteractionQueryFrame(7),
+  );
+  assert(responseFrame, "Expected interactionQuery to produce a client response frame");
+  const [responseBytes] = decodeConnectStreamingMessages(responseFrame);
+  assert(responseBytes, "Expected interaction response frame to contain one protobuf message");
+  const responseMessage = fromBinary(AgentClientMessageSchema, responseBytes);
+  if (responseMessage.message.case !== "interactionResponse") {
+    throw new Error(
+      `Expected interactionQuery to be answered with interactionResponse, got ${responseMessage.message.case}`,
+    );
+  }
+  const response = responseMessage.message.value;
+  assertEqual(response.id, 7, "Expected interactionResponse to preserve query id");
+  if (response.result.case !== "askQuestionInteractionResponse") {
+    throw new Error(
+      `Expected askQuestion interaction response type, got ${response.result.case}`,
+    );
+  }
+  assertEqual(
+    response.result.value.result?.result.case,
+    "rejected",
+    "Expected askQuestion interaction query to be rejected instead of hanging",
+  );
+  console.log("[test] interactionQuery rejection response OK");
 }
 
 async function testStreamingResponseEmitsAllMcpArgs(
@@ -809,6 +883,7 @@ async function main() {
     await testToolResultContinuationFallsBackToToolCallId(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
     await testStreamingResponseEmitsAllMcpArgs(modules);
+    await testInteractionQueryIsRejected(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

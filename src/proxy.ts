@@ -19,9 +19,20 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
+  AskQuestionInteractionResponseSchema,
+  AskQuestionRejectedSchema,
+  AskQuestionResultSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
+  CreatePlanErrorSchema,
+  CreatePlanRequestResponseSchema,
+  CreatePlanResultSchema,
+  ExaFetchRequestResponse_RejectedSchema,
+  ExaFetchRequestResponseSchema,
+  ExaSearchRequestResponse_RejectedSchema,
+  ExaSearchRequestResponseSchema,
+  InteractionResponseSchema,
   ConversationStepSchema,
   AgentConversationTurnStructureSchema,
   ConversationTurnStructureSchema,
@@ -55,7 +66,11 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  SwitchModeRequestResponse_RejectedSchema,
+  SwitchModeRequestResponseSchema,
   UserMessageActionSchema,
+  WebSearchRequestResponse_RejectedSchema,
+  WebSearchRequestResponseSchema,
   UserMessageSchema,
   WriteRejectedSchema,
   WriteResultSchema,
@@ -64,6 +79,7 @@ import {
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
+  type InteractionQuery,
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb";
@@ -500,7 +516,7 @@ function handleChatCompletion(
   let stored = conversationStates.get(convKey);
   if (!stored) {
     stored = {
-      conversationId: crypto.randomUUID(),
+      conversationId: deterministicConversationId(convKey),
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
@@ -532,12 +548,14 @@ function findActiveBridge(
   bridgeKey: string,
   toolResults: ToolResultInfo[],
 ): ActiveBridgeMatch | undefined {
+  if (process.env.DEBUG_PROXY) console.log(`[proxy] findActiveBridge: bridgeKey=${bridgeKey} toolResults=${toolResults.length}`);
   const exact = activeBridges.get(bridgeKey);
   if (exact) return { key: bridgeKey, active: exact };
   if (toolResults.length === 0) return undefined;
 
   const fallbackKey = findActiveBridgeKeyByToolCallId(activeBridges, toolResults);
   if (!fallbackKey) return undefined;
+  if (process.env.DEBUG_PROXY) console.log(`[proxy] findActiveBridge: fallback match via toolCallId key=${fallbackKey}`);
   return { key: fallbackKey, active: activeBridges.get(fallbackKey)! };
 }
 
@@ -943,6 +961,9 @@ function processServerMessage(
   onBlobSet?: (blobIdKey: string, blobData: Uint8Array) => void,
 ): void {
   const msgCase = msg.message.case;
+  if (process.env.DEBUG_PROXY) {
+    console.log(`[proxy] server message: ${msgCase}`);
+  }
 
   if (msgCase === "interactionUpdate") {
     handleInteractionUpdate(msg.message.value, state, onText);
@@ -955,6 +976,8 @@ function processServerMessage(
       sendFrame,
       onMcpExec,
     );
+  } else if (msgCase === "interactionQuery") {
+    handleInteractionQuery(msg.message.value as InteractionQuery, sendFrame);
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -963,6 +986,110 @@ function processServerMessage(
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
+  }
+}
+
+const UNSUPPORTED_INTERACTION_REASON = "Not supported by this OpenAI-compatible proxy";
+
+function handleInteractionQuery(
+  query: InteractionQuery,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const queryCase = query.query.case;
+  console.warn(`[proxy] rejecting interactionQuery: ${queryCase}`);
+
+  const response = create(InteractionResponseSchema, {
+    id: query.id,
+    result: createInteractionResponseResult(queryCase),
+  });
+  const clientMsg = create(AgentClientMessageSchema, {
+    message: { case: "interactionResponse", value: response },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
+}
+
+function createInteractionResponseResult(queryCase: InteractionQuery["query"]["case"]) {
+  switch (queryCase) {
+    case "webSearchRequestQuery":
+      return {
+        case: "webSearchRequestResponse" as const,
+        value: create(WebSearchRequestResponseSchema, {
+          result: {
+            case: "rejected",
+            value: create(WebSearchRequestResponse_RejectedSchema, {
+              reason: UNSUPPORTED_INTERACTION_REASON,
+            }),
+          },
+        }),
+      };
+    case "askQuestionInteractionQuery":
+      return {
+        case: "askQuestionInteractionResponse" as const,
+        value: create(AskQuestionInteractionResponseSchema, {
+          result: create(AskQuestionResultSchema, {
+            result: {
+              case: "rejected",
+              value: create(AskQuestionRejectedSchema, {
+                reason: UNSUPPORTED_INTERACTION_REASON,
+              }),
+            },
+          }),
+        }),
+      };
+    case "switchModeRequestQuery":
+      return {
+        case: "switchModeRequestResponse" as const,
+        value: create(SwitchModeRequestResponseSchema, {
+          result: {
+            case: "rejected",
+            value: create(SwitchModeRequestResponse_RejectedSchema, {
+              reason: UNSUPPORTED_INTERACTION_REASON,
+            }),
+          },
+        }),
+      };
+    case "exaSearchRequestQuery":
+      return {
+        case: "exaSearchRequestResponse" as const,
+        value: create(ExaSearchRequestResponseSchema, {
+          result: {
+            case: "rejected",
+            value: create(ExaSearchRequestResponse_RejectedSchema, {
+              reason: UNSUPPORTED_INTERACTION_REASON,
+            }),
+          },
+        }),
+      };
+    case "exaFetchRequestQuery":
+      return {
+        case: "exaFetchRequestResponse" as const,
+        value: create(ExaFetchRequestResponseSchema, {
+          result: {
+            case: "rejected",
+            value: create(ExaFetchRequestResponse_RejectedSchema, {
+              reason: UNSUPPORTED_INTERACTION_REASON,
+            }),
+          },
+        }),
+      };
+    case "createPlanRequestQuery":
+      return {
+        case: "createPlanRequestResponse" as const,
+        value: create(CreatePlanRequestResponseSchema, {
+          result: create(CreatePlanResultSchema, {
+            planUri: "",
+            result: {
+              case: "error",
+              value: create(CreatePlanErrorSchema, {
+                error: UNSUPPORTED_INTERACTION_REASON,
+              }),
+            },
+          }),
+        }),
+      };
+    case "setupVmEnvironmentArgs":
+    case undefined:
+      return { case: undefined };
   }
 }
 
@@ -1298,6 +1425,19 @@ function createBridgeStreamResponse(
           usage: { prompt_tokens, completion_tokens, total_tokens },
         };
       };
+      const finishStream = (finishReason: string, endBridge = false) => {
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+        sendSSE(makeChunk({}, finishReason));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        if (endBridge) {
+          clearInterval(heartbeatTimer);
+          bridge.end();
+        }
+      };
 
       const state: StreamState = {
         toolCallIndex: 0,
@@ -1364,11 +1504,8 @@ function createBridgeStreamResponse(
 
                 if (!toolCallFinishScheduled) {
                   toolCallFinishScheduled = true;
-                  queueMicrotask(() => {
-                    sendSSE(makeChunk({}, "tool_calls"));
-                    sendDone();
-                    closeController();
-                  });
+                  // Don't close here — wait for bridge onClose to finalize.
+                  // This ensures all tool calls in this turn are captured.
                 }
               },
               (checkpointBytes) => {
@@ -1394,6 +1531,10 @@ function createBridgeStreamResponse(
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+          } else if (!mcpExecReceived) {
+            finishStream("stop", true);
+          } else if (activeBridges.has(bridgeKey)) {
+            finishStream("tool_calls");
           }
         },
       );
@@ -1407,30 +1548,55 @@ function createBridgeStreamResponse(
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
           stored.lastAccessMs = Date.now();
         }
+
         if (!mcpExecReceived) {
-          const flushed = tagFilter.flush();
-          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
-        } else if (code !== 0) {
-          // Bridge died while tool calls are pending (timeout, crash, etc.).
+          // Normal completion — no tool calls were emitted.
+          finishStream("stop");
+        } else if (activeBridges.has(bridgeKey)) {
+          // Bridge stream ended while tool calls are pending and bridge is kept alive.
+          // Finalize this SSE stream so the client can process tool_calls.
+          finishStream("tool_calls");
+        } else {
+          // Bridge died unexpectedly (timeout, crash, etc.).
           // Close the SSE stream so the client doesn't hang forever.
           sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
           sendDone();
           closeController();
-          // Remove stale entry so the next request doesn't try to resume it.
-          activeBridges.delete(bridgeKey);
         }
       });
     },
   });
 
   return new Response(stream, { headers: SSE_HEADERS });
+}
+
+export function __testInteractionResponseFromQueryFrame(frame: Uint8Array): Uint8Array[] {
+  const responses: Uint8Array[] = [];
+  const state: StreamState = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+  };
+  const processChunk = createConnectFrameParser(
+    (messageBytes) => {
+      const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+      processServerMessage(
+        serverMessage,
+        new Map(),
+        [],
+        (data) => responses.push(new Uint8Array(data)),
+        state,
+        () => {},
+        () => {},
+      );
+    },
+    () => {},
+  );
+  processChunk(Buffer.from(frame));
+  return responses;
 }
 
 export function __testEmitToolCallsFromConnectFrames(frames: Uint8Array[]): string[] {
