@@ -47,6 +47,7 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy, src/proxy.ts)
 - **`CURSOR_API_URL`** env var overrides `https://api2.cursor.sh` for testing.
 - **`CURSOR_REFRESH_URL`** env var overrides the token refresh endpoint.
 - **`CURSOR_BRIDGE_INACTIVITY_TIMEOUT_MS`** env var controls the H2 bridge inactivity guard; default is 10 minutes so long subagent tool runs do not kill the bridge at 2 minutes.
+- **`CURSOR_PROXY_STREAM_IDLE_TIMEOUT_MS`** env var controls the proxy-side SSE idle guard after assistant text; default is 60 seconds and does not apply while a tool call is pending.
 
 ## Auto Model Routing
 

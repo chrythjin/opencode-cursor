@@ -57,6 +57,11 @@ Bun's `node:http2` support is not reliable against Cursor's API.
 The default is 10 minutes so long OpenCode tool calls can return before the
 paused Cursor stream is killed.
 
+`CURSOR_PROXY_STREAM_IDLE_TIMEOUT_MS` can override the proxy-side SSE idle guard.
+The default is 60 seconds. It only applies after assistant text has streamed and
+no tool call is pending, so a Cursor stream that never sends a terminal frame
+does not leave OpenCode waiting forever.
+
 ## Architecture
 
 ```
