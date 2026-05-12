@@ -5,6 +5,7 @@ import type { ServerHttp2Stream } from "node:http2";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
+  AgentRunRequestSchema,
   AgentServerMessageSchema,
   AskQuestionInteractionQuerySchema,
   ExecServerMessageSchema,
@@ -41,6 +42,8 @@ interface ObservedRunRequest {
   requestedModelId: string | undefined;
   hasModelDetails: boolean;
   displayName: string | undefined;
+  actionUserText: string | undefined;
+  historyTurnCount: number;
 }
 
 interface TestCursorBackend {
@@ -205,12 +208,21 @@ function observeRunRequest(body: Uint8Array): ObservedRunRequest | null {
   const clientMessage = fromBinary(AgentClientMessageSchema, messageBytes);
   if (clientMessage.message.case !== "runRequest") return null;
   const runRequest = clientMessage.message.value;
+  const decodedRunRequest = fromBinary(
+    AgentRunRequestSchema,
+    toBinary(AgentRunRequestSchema, runRequest),
+  );
+  const action = decodedRunRequest.action?.action;
   return {
     conversationId: runRequest.conversationId,
     modelId: runRequest.modelDetails?.modelId,
     requestedModelId: runRequest.requestedModel?.modelId,
     hasModelDetails: runRequest.modelDetails !== undefined,
     displayName: runRequest.modelDetails?.displayName,
+    actionUserText: action?.case === "userMessageAction"
+      ? action.value.userMessage?.text
+      : undefined,
+    historyTurnCount: decodedRunRequest.conversationState?.turns.length ?? 0,
   };
 }
 
@@ -658,6 +670,47 @@ async function testAutoModelSendsCursorDefaultModel(
   console.log("[test] Auto model request encoding OK");
 }
 
+async function testFollowUpUserMessageBecomesCursorAction(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing follow-up user message action parsing...");
+  backend.resetObservations();
+  const port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "auto",
+      stream: false,
+      messages: [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: "first answer" },
+        { role: "user", content: "second question" },
+      ],
+    }),
+  });
+
+  const [request] = backend.getRunRequests();
+  assert(request, "Expected follow-up auto request to reach Cursor backend");
+  assertEqual(
+    request.actionUserText,
+    "second question",
+    "Expected the latest user message to be sent as the Cursor action",
+  );
+  assertEqual(
+    request.historyTurnCount,
+    1,
+    "Expected earlier user/assistant exchange to be preserved as history",
+  );
+
+  modules.stopProxy();
+  console.log("[test] follow-up user message action parsing OK");
+}
+
 async function testToolResultContinuationFallsBackToToolCallId(
   modules: TestModules,
 ) {
@@ -825,6 +878,29 @@ async function testStreamingResponseClosesOnTurnEnded(
   console.log("[test] turnEnded stream closure OK");
 }
 
+async function testStreamingResponseClosesOnIdleText(
+  modules: TestModules,
+) {
+  console.log("[test] Testing idle text stream closure...");
+  const sseText = await modules.__testStreamToolCallsFromConnectFrames(
+    [makeTextDeltaFrame("hello without terminal frame")],
+    10,
+  );
+  assert(
+    sseText.includes("hello without terminal frame"),
+    "Expected text delta to be emitted before idle closure",
+  );
+  assert(
+    sseText.includes('"finish_reason":"stop"'),
+    "Expected idle text stream to finish instead of hanging",
+  );
+  assert(
+    sseText.includes("data: [DONE]"),
+    "Expected idle text stream to close with [DONE]",
+  );
+  console.log("[test] idle text stream closure OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -976,12 +1052,14 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testAutoModelSendsCursorDefaultModel(modules, backend);
+    await testFollowUpUserMessageBecomesCursorAction(modules, backend);
     await testToolResultContinuationFallsBackToToolCallId(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
-    await testStreamingResponseEmitsAllMcpArgs(modules);
-    await testStreamingResponseClosesOnConnectError(modules);
-    await testStreamingResponseClosesOnTurnEnded(modules);
-    await testInteractionQueryIsRejected(modules);
+  await testStreamingResponseEmitsAllMcpArgs(modules);
+  await testStreamingResponseClosesOnConnectError(modules);
+  await testStreamingResponseClosesOnTurnEnded(modules);
+  await testStreamingResponseClosesOnIdleText(modules);
+  await testInteractionQueryIsRejected(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

@@ -89,11 +89,21 @@ import { resolve as pathResolve } from "node:path";
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+const PROXY_STREAM_IDLE_TIMEOUT_MS = readPositiveEnvNumber(
+  process.env.CURSOR_PROXY_STREAM_IDLE_TIMEOUT_MS,
+  60_000,
+);
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 } as const;
+
+function readPositiveEnvNumber(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 interface OpenAIToolCall {
   id: string;
@@ -639,7 +649,8 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     systemPrompt = systemParts.join("\n");
   }
 
-  // Separate tool results from conversation turns
+  // Separate tool results from conversation turns. The final user message is the
+  // new Cursor action; earlier user/assistant pairs become conversation history.
   const nonSystem = messages.filter((m) => m.role !== "system");
   let pendingUser = "";
 
@@ -660,6 +671,11 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       if (pendingUser) {
         pairs.push({ userText: pendingUser, assistantText: text });
         pendingUser = "";
+      } else if (pairs.length > 0) {
+        const last = pairs[pairs.length - 1];
+        if (!last.assistantText) {
+          last.assistantText = text;
+        }
       }
     }
   }
@@ -1385,6 +1401,7 @@ function createBridgeStreamResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  streamIdleTimeoutMs = PROXY_STREAM_IDLE_TIMEOUT_MS,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1405,6 +1422,21 @@ function createBridgeStreamResponse(
         if (closed) return;
         closed = true;
         controller.close();
+      };
+
+      let streamIdleTimer: NodeJS.Timeout | undefined;
+      const clearStreamIdleTimer = () => {
+        if (streamIdleTimer) clearTimeout(streamIdleTimer);
+        streamIdleTimer = undefined;
+      };
+      const armStreamIdleTimer = () => {
+        clearStreamIdleTimer();
+        // Only close idle assistant-text streams; tool-call continuations keep the bridge alive.
+        if (mcpExecReceived || streamIdleTimeoutMs <= 0) return;
+        streamIdleTimer = setTimeout(() => {
+          if (closed || mcpExecReceived) return;
+          finishStream("stop", true);
+        }, streamIdleTimeoutMs);
       };
 
       const makeChunk = (
@@ -1431,6 +1463,7 @@ function createBridgeStreamResponse(
       };
       const finishStream = (finishReason: string, endBridge = false) => {
         if (closed) return;
+        clearStreamIdleTimer();
         const flushed = tagFilter.flush();
         if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
         if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
@@ -1475,11 +1508,13 @@ function createBridgeStreamResponse(
                   if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
                   if (content) sendSSE(makeChunk({ content }));
                 }
+                armStreamIdleTimer();
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
+                clearStreamIdleTimer();
 
                 const flushed = tagFilter.flush();
                 if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1558,6 +1593,7 @@ function createBridgeStreamResponse(
 
       bridge.onClose(() => {
         clearInterval(heartbeatTimer);
+        clearStreamIdleTimer();
         const stored = conversationStates.get(convKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -1647,7 +1683,10 @@ export function __testEmitToolCallsFromConnectFrames(frames: Uint8Array[]): stri
   return emittedToolCallIds;
 }
 
-export async function __testStreamToolCallsFromConnectFrames(frames: Uint8Array[]): Promise<string> {
+export async function __testStreamToolCallsFromConnectFrames(
+  frames: Uint8Array[],
+  streamIdleTimeoutMs = PROXY_STREAM_IDLE_TIMEOUT_MS,
+): Promise<string> {
   const bridgeCallbacks: {
     data?: (chunk: Buffer) => void;
     close?: (code: number) => void;
@@ -1669,6 +1708,7 @@ export async function __testStreamToolCallsFromConnectFrames(frames: Uint8Array[
     "auto",
     bridgeKey,
     "test-auto-conversation",
+    streamIdleTimeoutMs,
   );
   const reader = response.body!.getReader();
   for (const frame of frames) bridgeCallbacks.data?.(Buffer.from(frame));
