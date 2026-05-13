@@ -744,6 +744,44 @@ async function testFollowUpUserMessageBecomesCursorAction(
   console.log("[test] follow-up user message action parsing OK");
 }
 
+async function testCompletedTranscriptDoesNotReplayLastUser(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing completed transcript is not replayed...");
+  backend.resetObservations();
+  const port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  const response = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "auto",
+      stream: false,
+      messages: [
+        { role: "user", content: "do not run this again" },
+        { role: "assistant", content: "already answered" },
+      ],
+    }),
+  });
+
+  assertEqual(
+    response.status,
+    400,
+    "Expected a completed transcript without a new user message to be rejected",
+  );
+  assertEqual(
+    backend.getRunRequests().length,
+    0,
+    "Expected completed transcript rejection to avoid replaying the last user message",
+  );
+
+  modules.stopProxy();
+  console.log("[test] completed transcript replay guard OK");
+}
+
 async function testFollowUpIgnoresStoredCheckpoint(
   modules: TestModules,
 ) {
@@ -1123,6 +1161,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testAutoModelSendsCursorDefaultModel(modules, backend);
     await testFollowUpUserMessageBecomesCursorAction(modules, backend);
+    await testCompletedTranscriptDoesNotReplayLastUser(modules, backend);
     await testFollowUpIgnoresStoredCheckpoint(modules);
     await testToolResultContinuationFallsBackToToolCallId(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);

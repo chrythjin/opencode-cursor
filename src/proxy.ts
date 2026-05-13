@@ -710,9 +710,6 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let lastUserText = "";
   if (pendingUser) {
     lastUserText = pendingUser;
-  } else if (pairs.length > 0 && toolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
   }
 
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
