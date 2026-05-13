@@ -782,6 +782,56 @@ async function testCompletedTranscriptDoesNotReplayLastUser(
   console.log("[test] completed transcript replay guard OK");
 }
 
+async function testOrphanToolResultDoesNotStartFreshRun(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing orphan tool result is rejected...");
+  backend.resetObservations();
+  const port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  const response = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "auto",
+      messages: [
+        { role: "user", content: "find a file" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "missing-tool-call",
+            type: "function",
+            function: { name: "glob", arguments: "{}" },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: "missing-tool-call",
+          content: "No files found",
+        },
+      ],
+    }),
+  });
+
+  assertEqual(
+    response.status,
+    409,
+    "Expected orphan tool results to be rejected instead of starting a fresh Cursor run",
+  );
+  assertEqual(
+    backend.getRunRequests().length,
+    0,
+    "Expected orphan tool-result rejection to avoid replaying tool output as a new request",
+  );
+
+  modules.stopProxy();
+  console.log("[test] orphan tool result replay guard OK");
+}
+
 async function testFollowUpIgnoresStoredCheckpoint(
   modules: TestModules,
 ) {
@@ -1162,14 +1212,15 @@ async function main() {
     await testAutoModelSendsCursorDefaultModel(modules, backend);
     await testFollowUpUserMessageBecomesCursorAction(modules, backend);
     await testCompletedTranscriptDoesNotReplayLastUser(modules, backend);
+    await testOrphanToolResultDoesNotStartFreshRun(modules, backend);
     await testFollowUpIgnoresStoredCheckpoint(modules);
     await testToolResultContinuationFallsBackToToolCallId(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
-  await testStreamingResponseEmitsAllMcpArgs(modules);
-  await testStreamingResponseClosesOnConnectError(modules);
-  await testStreamingResponseClosesOnTurnEnded(modules);
-  await testStreamingResponseClosesOnIdleText(modules);
-  await testInteractionQueryIsRejected(modules);
+    await testStreamingResponseEmitsAllMcpArgs(modules);
+    await testStreamingResponseClosesOnConnectError(modules);
+    await testStreamingResponseClosesOnTurnEnded(modules);
+    await testStreamingResponseClosesOnIdleText(modules);
+    await testInteractionQueryIsRejected(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

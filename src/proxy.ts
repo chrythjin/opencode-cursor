@@ -502,7 +502,9 @@ function handleChatCompletion(
   const activeBridge = activeBridgeMatch?.active;
   const activeBridgeKey = activeBridgeMatch?.key ?? createActiveBridgeKey(bridgeLookupKey);
 
-  if (activeBridge && toolResults.length > 0) {
+  if (toolResults.length > 0) {
+    if (!activeBridge) return missingToolResultBridgeResponse();
+
     activeBridges.delete(activeBridgeKey);
 
     if (activeBridge.bridge.alive) {
@@ -510,10 +512,11 @@ function handleChatCompletion(
       return handleToolResultResume(activeBridge, toolResults, modelId, activeBridgeKey, convKey);
     }
 
-    // Bridge died (timeout, server disconnect, etc.).
-    // Clean up and fall through to start a fresh bridge.
+    // Bridge died (timeout, server disconnect, etc.). Do not start a fresh
+    // Cursor turn from tool output; that replays the same failed tool request.
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
+    return missingToolResultBridgeResponse();
   }
 
   // Clean up stale bridge if present
@@ -623,6 +626,18 @@ export function __testFindActiveBridgeKeyByToolCallId(
       ]),
     ),
     toolCallIds.map((toolCallId) => ({ toolCallId })),
+  );
+}
+
+function missingToolResultBridgeResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "Tool result continuation expired or was not found. Retry the original request instead of replaying tool output.",
+        type: "tool_result_continuation_not_found",
+      },
+    }),
+    { status: 409, headers: { "Content-Type": "application/json" } },
   );
 }
 
