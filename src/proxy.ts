@@ -586,13 +586,31 @@ function findActiveBridge(
 ): ActiveBridgeMatch | undefined {
   if (process.env.DEBUG_PROXY) console.log(`[proxy] findActiveBridge: bridgeKey=${bridgeKey} toolResults=${toolResults.length}`);
   const exact = activeBridges.get(bridgeKey);
-  if (exact) return { key: bridgeKey, active: exact };
+  if (exact) {
+    // Verify the bridge is still alive before returning it.
+    if (!exact.bridge.alive) {
+      if (process.env.DEBUG_PROXY) console.log(`[proxy] findActiveBridge: exact match but bridge is dead, deleting`);
+      clearInterval(exact.heartbeatTimer);
+      activeBridges.delete(bridgeKey);
+      // Fall through to tool_call_id fallback or return undefined.
+    } else {
+      return { key: bridgeKey, active: exact };
+    }
+  }
   if (toolResults.length === 0) return undefined;
 
   const fallbackKey = findActiveBridgeKeyByToolCallId(activeBridges, toolResults);
   if (!fallbackKey) return undefined;
+  const fallbackActive = activeBridges.get(fallbackKey)!;
+  // Verify the fallback bridge is still alive before using it.
+  if (!fallbackActive.bridge.alive) {
+    if (process.env.DEBUG_PROXY) console.log(`[proxy] findActiveBridge: fallback match but bridge is dead, deleting`);
+    clearInterval(fallbackActive.heartbeatTimer);
+    activeBridges.delete(fallbackKey);
+    return undefined;
+  }
   if (process.env.DEBUG_PROXY) console.log(`[proxy] findActiveBridge: fallback match via toolCallId key=${fallbackKey}`);
-  return { key: fallbackKey, active: activeBridges.get(fallbackKey)! };
+  return { key: fallbackKey, active: fallbackActive };
 }
 
 function findActiveBridgeKeyByToolCallId(
@@ -634,6 +652,10 @@ export function __testFindActiveBridgeKeyByToolCallId(
     ),
     toolCallIds.map((toolCallId) => ({ toolCallId })),
   );
+}
+
+export function __testDeriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
+  return deriveBridgeKey(modelId, messages);
 }
 
 function missingToolResultBridgeResponse(): Response {
@@ -1401,7 +1423,10 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
+/** Derive a key for active bridge lookup (tool-call continuations). Model-specific.
+ *  Skips tool-role messages so that tool-result follow-ups derive the same key
+ *  as the original request (tool results are appended after the real first user
+ *  prompt, not before it). */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";

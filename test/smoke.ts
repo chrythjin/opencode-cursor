@@ -26,7 +26,8 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   __testFindActiveBridgeKeyByToolCallId: typeof import("../src/proxy").__testFindActiveBridgeKeyByToolCallId;
-  __testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
+__testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
+  __testDeriveBridgeKey: typeof import("../src/proxy").__testDeriveBridgeKey;
   __testBuildPayloadFromOpenAiMessages: typeof import("../src/proxy").__testBuildPayloadFromOpenAiMessages;
   __testEmitToolCallsFromConnectFrames: typeof import("../src/proxy").__testEmitToolCallsFromConnectFrames;
   __testStreamToolCallsFromConnectFrames: typeof import("../src/proxy").__testStreamToolCallsFromConnectFrames;
@@ -422,8 +423,9 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
-    __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
+__testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCallId,
     __testCreateActiveBridgeKey: proxy.__testCreateActiveBridgeKey,
+    __testDeriveBridgeKey: proxy.__testDeriveBridgeKey,
     __testBuildPayloadFromOpenAiMessages: proxy.__testBuildPayloadFromOpenAiMessages,
     __testEmitToolCallsFromConnectFrames: proxy.__testEmitToolCallsFromConnectFrames,
     __testStreamToolCallsFromConnectFrames: proxy.__testStreamToolCallsFromConnectFrames,
@@ -929,6 +931,59 @@ async function testToolResultContinuationFallsBackToToolCallId(
   console.log("[test] Tool-result continuation fallback OK");
 }
 
+async function testDeriveBridgeKeySkipsToolRoleMessages(
+  modules: TestModules,
+) {
+  console.log("[test] Testing deriveBridgeKey skips tool-role messages...");
+
+  // Initial request: first user message is "initial prompt"
+  const initialMessages = [
+    { role: "user" as const, content: "initial prompt" },
+  ];
+  const initialKey = modules.__testDeriveBridgeKey("auto", initialMessages);
+
+  // Follow-up with tool results prepended: the first user message should still
+  // resolve to "initial prompt" so the bridge key matches the original.
+  const followUpMessages = [
+    { role: "tool" as const, content: "tool result content", tool_call_id: "tool-1" },
+    { role: "user" as const, content: "initial prompt" },
+  ];
+  const followUpKey = modules.__testDeriveBridgeKey("auto", followUpMessages);
+
+  assertEqual(
+    followUpKey,
+    initialKey,
+    "Expected deriveBridgeKey to skip tool-role messages and match initial key",
+  );
+
+  // Tool result prepended AND more user messages after — first user still "initial prompt"
+  const multiTurnMessages = [
+    { role: "tool" as const, content: "tool result content", tool_call_id: "tool-1" },
+    { role: "user" as const, content: "initial prompt" },
+    { role: "assistant" as const, content: "some answer" },
+    { role: "user" as const, content: "follow-up question" },
+  ];
+  const multiTurnKey = modules.__testDeriveBridgeKey("auto", multiTurnMessages);
+  assertEqual(
+    multiTurnKey,
+    initialKey,
+    "Expected deriveBridgeKey to skip tool messages and find first user among all messages",
+  );
+
+  // Different first user text should produce a different key
+  const differentPromptMessages = [
+    { role: "tool" as const, content: "tool result content", tool_call_id: "tool-1" },
+    { role: "user" as const, content: "different prompt" },
+  ];
+  const differentKey = modules.__testDeriveBridgeKey("auto", differentPromptMessages);
+  assert(
+    differentKey !== initialKey,
+    "Expected different first user text to produce a different bridge key",
+  );
+
+  console.log("[test] deriveBridgeKey skips tool-role messages OK");
+}
+
 async function testParallelAutoBridgeKeysDoNotCollide(
   modules: TestModules,
 ) {
@@ -1256,7 +1311,8 @@ async function main() {
     await testCompletedTranscriptDoesNotReplayLastUser(modules, backend);
     await testOrphanToolResultDoesNotStartFreshRun(modules, backend);
     await testFollowUpIgnoresStoredCheckpoint(modules);
-    await testToolResultContinuationFallsBackToToolCallId(modules);
+await testToolResultContinuationFallsBackToToolCallId(modules);
+    await testDeriveBridgeKeySkipsToolRoleMessages(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
     await testStreamingResponseEmitsAllMcpArgs(modules);
     await testStreamingResponseClosesOnConnectError(modules);
