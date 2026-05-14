@@ -377,6 +377,7 @@ let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 const CURSOR_AUTO_PROXY_MODEL = { id: "auto", name: "Auto" };
+const CURSOR_PROVIDER_PREFIX = "cursor/";
 
 let proxyModels: Array<{ id: string; name: string }> = [];
 
@@ -399,6 +400,12 @@ function mergeAutoProxyModel(
 ): Array<{ id: string; name: string }> {
   const withoutAuto = models.filter((model) => model.id !== CURSOR_AUTO_PROXY_MODEL.id);
   return [...withoutAuto, CURSOR_AUTO_PROXY_MODEL];
+}
+
+function normalizeOpenAIModelId(modelId: string): string {
+  return modelId === `${CURSOR_PROVIDER_PREFIX}${CURSOR_AUTO_PROXY_MODEL.id}`
+    ? CURSOR_AUTO_PROXY_MODEL.id
+    : modelId;
 }
 
 export function getProxyPort(): number | undefined {
@@ -479,7 +486,7 @@ function handleChatCompletion(
   accessToken: string,
 ): Response | Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
-  const modelId = body.model;
+  const modelId = normalizeOpenAIModelId(body.model);
   const tools = body.tools ?? [];
 
   if (!userText && toolResults.length === 0) {

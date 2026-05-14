@@ -645,6 +645,26 @@ async function testAutoModelSendsCursorDefaultModel(
     }),
   });
 
+  await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "cursor/auto",
+      stream: false,
+      messages: [{ role: "user", content: "use provider qualified auto model selection" }],
+    }),
+  });
+
+  await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "cursor/composer-2",
+      stream: false,
+      messages: [{ role: "user", content: "use provider qualified explicit model selection" }],
+    }),
+  });
+
   modules.stopProxy();
   port = await modules.startProxy(async () => "test-token", [
     { id: "composer-2", name: "Composer 2" },
@@ -660,7 +680,7 @@ async function testAutoModelSendsCursorDefaultModel(
     }),
   });
 
-  const [autoRequest, explicitRequest, restartedAutoRequest] = backend.getRunRequests();
+  const [autoRequest, explicitRequest, qualifiedAutoRequest, qualifiedExplicitRequest, restartedAutoRequest] = backend.getRunRequests();
   assert(autoRequest, "Expected auto model request to reach Cursor backend");
   assert(
     autoRequest.hasModelDetails,
@@ -680,6 +700,28 @@ async function testAutoModelSendsCursorDefaultModel(
     autoRequest.displayName,
     "Auto",
     "Expected auto model to display as Auto",
+  );
+  assert(qualifiedAutoRequest, "Expected provider-qualified auto model request to reach Cursor backend");
+  assertEqual(
+    qualifiedAutoRequest.modelId,
+    "default",
+    "Expected provider-qualified auto model to use Cursor default modelDetails id",
+  );
+  assertEqual(
+    qualifiedAutoRequest.requestedModelId,
+    "default",
+    "Expected provider-qualified auto model to use Cursor default requestedModel id",
+  );
+  assert(qualifiedExplicitRequest, "Expected provider-qualified explicit model request to reach Cursor backend");
+  assertEqual(
+    qualifiedExplicitRequest.modelId,
+    "cursor/composer-2",
+    "Expected provider-qualified explicit model id to remain unchanged",
+  );
+  assertEqual(
+    qualifiedExplicitRequest.requestedModelId,
+    "cursor/composer-2",
+    "Expected provider-qualified explicit requestedModel id to remain unchanged",
   );
   assert(restartedAutoRequest, "Expected restarted auto model request to reach Cursor backend");
   assertEqual(
