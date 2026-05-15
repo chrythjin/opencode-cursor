@@ -1126,7 +1126,6 @@ async function testStreamingResponseEmitsAllMcpArgs(
   const frames = [
     makeMcpExecFrame(1, "tool-call-a", "first_tool"),
     makeMcpExecFrame(2, "tool-call-b", "second_tool"),
-    frameConnectEndStream(),
   ];
   const toolCallIds = modules.__testEmitToolCallsFromConnectFrames(frames);
   assertArrayEqual(
@@ -1145,6 +1144,37 @@ async function testStreamingResponseEmitsAllMcpArgs(
     "Expected streaming tool-call response to close with [DONE]",
   );
   console.log("[test] Multi-tool stream frame handling OK");
+}
+
+async function testStreamingResponseRejectsClosedToolBridge(
+  modules: TestModules,
+) {
+  console.log("[test] Testing closed bridge tool-call rejection...");
+  const sseText = await modules.__testStreamToolCallsFromConnectFrames([
+    makeMcpExecFrame(1, "tool-call-closed", "read_file"),
+    frameConnectEndStream(),
+  ]);
+  assert(
+    sseText.includes("bridge closed before tool result continuation"),
+    "Expected closed bridge to be reported before tool execution",
+  );
+  assert(
+    !sseText.includes('"tool_calls"'),
+    `Expected closed bridge not to emit any tool_calls delta, got ${sseText}`,
+  );
+  assert(
+    !sseText.includes('"finish_reason":"tool_calls"'),
+    "Expected closed bridge not to advertise resumable tool_calls",
+  );
+  assert(
+    sseText.includes('"finish_reason":"stop"'),
+    "Expected closed bridge response to finish with stop",
+  );
+  assert(
+    sseText.includes("data: [DONE]"),
+    "Expected closed bridge response to close with [DONE]",
+  );
+  console.log("[test] Closed bridge tool-call rejection OK");
 }
 
 async function testStreamingResponseClosesOnConnectError(
@@ -1463,6 +1493,7 @@ await testToolResultContinuationFallsBackToToolCallId(modules);
     testToolResultResumeAttachesDataHandlerBeforeWrite(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
     await testStreamingResponseEmitsAllMcpArgs(modules);
+    await testStreamingResponseRejectsClosedToolBridge(modules);
     await testStreamingResponseClosesOnConnectError(modules);
     await testStreamingResponseClosesOnTurnEnded(modules);
     await testStreamingResponseClosesOnIdleText(modules);

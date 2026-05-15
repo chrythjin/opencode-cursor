@@ -1573,9 +1573,16 @@ function createBridgeStreamResponse(
           usage: { prompt_tokens, completion_tokens, total_tokens },
         };
       };
+      let toolCallFlushTimer: NodeJS.Timeout | undefined;
+      const clearToolCallFlushTimer = () => {
+        if (toolCallFlushTimer) clearTimeout(toolCallFlushTimer);
+        toolCallFlushTimer = undefined;
+      };
+
       const finishStream = (finishReason: string, endBridge = false) => {
         if (closed) return;
         clearStreamIdleTimer();
+        clearToolCallFlushTimer();
         const flushed = tagFilter.flush();
         if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
         if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
@@ -1599,6 +1606,20 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
       let toolCallFinishScheduled = false;
+      const pendingToolCallChunks: Record<string, unknown>[] = [];
+      const flushPendingToolCalls = () => {
+        toolCallFlushTimer = undefined;
+        if (closed) return;
+        if (!activeBridges.has(bridgeKey) || !bridge.alive) {
+          activeBridges.delete(bridgeKey);
+          sendSSE(makeChunk({ content: "\n[Error: bridge closed before tool result continuation]" }));
+          finishStream("stop", true);
+          return;
+        }
+        for (const chunk of pendingToolCallChunks) sendSSE(makeChunk(chunk));
+        pendingToolCallChunks.length = 0;
+        finishStream("tool_calls");
+      };
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
           try {
@@ -1633,7 +1654,7 @@ function createBridgeStreamResponse(
                 if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
 
                 const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
+                pendingToolCallChunks.push({
                   tool_calls: [{
                     index: toolCallIndex,
                     id: exec.toolCallId,
@@ -1643,7 +1664,7 @@ function createBridgeStreamResponse(
                       arguments: exec.decodedArgs,
                     },
                   }],
-                }));
+                });
 
                 // Keep the bridge alive for tool result continuation.
                 activeBridges.set(bridgeKey, {
@@ -1656,11 +1677,7 @@ function createBridgeStreamResponse(
 
                 if (!toolCallFinishScheduled) {
                   toolCallFinishScheduled = true;
-                  queueMicrotask(() => {
-                    if (activeBridges.has(bridgeKey)) {
-                      finishStream("tool_calls");
-                    }
-                  });
+                  toolCallFlushTimer = setTimeout(flushPendingToolCalls, 0);
                 }
               },
               (checkpointBytes) => {
@@ -1696,7 +1713,9 @@ function createBridgeStreamResponse(
           } else if (!mcpExecReceived) {
             finishStream("stop", true);
           } else if (activeBridges.has(bridgeKey)) {
-            finishStream("tool_calls");
+            activeBridges.delete(bridgeKey);
+            sendSSE(makeChunk({ content: "\n[Error: bridge closed before tool result continuation]" }));
+            finishStream("stop", true);
           }
         },
       );
@@ -1716,9 +1735,11 @@ function createBridgeStreamResponse(
           // Normal completion — no tool calls were emitted.
           finishStream("stop");
         } else if (activeBridges.has(bridgeKey)) {
-          // Bridge stream ended while tool calls are pending and bridge is kept alive.
-          // Finalize this SSE stream so the client can process tool_calls.
-          finishStream("tool_calls");
+          // Bridge stream ended while tool calls are pending. A dead bridge cannot
+          // accept the later mcpResult, so do not advertise resumable tool_calls.
+          activeBridges.delete(bridgeKey);
+          sendSSE(makeChunk({ content: "\n[Error: bridge closed before tool result continuation]" }));
+          finishStream("stop");
         } else {
           // Bridge died unexpectedly (timeout, crash, etc.).
           // Close the SSE stream so the client doesn't hang forever.
