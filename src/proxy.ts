@@ -626,9 +626,21 @@ function findActiveBridgeKeyByToolCallId(
   ];
   if (toolCallIds.length === 0) return undefined;
 
+  const activePendingToolCallIds = new Set(
+    [...bridges.values()].flatMap((active) => active.pendingExecs.map((exec) => exec.toolCallId)),
+  );
+
   for (const [key, active] of bridges) {
     const pendingToolCallIds = new Set(active.pendingExecs.map((exec) => exec.toolCallId));
-    if (toolCallIds.every((toolCallId) => pendingToolCallIds.has(toolCallId))) {
+    const matchCount = toolCallIds.filter((toolCallId) => pendingToolCallIds.has(toolCallId)).length;
+    if (matchCount === 0) continue;
+    if (matchCount === toolCallIds.length) {
+      return key;
+    }
+    const unmatchedActiveToolCallIds = toolCallIds.filter(
+      (toolCallId) => !pendingToolCallIds.has(toolCallId) && activePendingToolCallIds.has(toolCallId),
+    );
+    if (unmatchedActiveToolCallIds.length === 0) {
       return key;
     }
   }
@@ -1514,6 +1526,7 @@ function createBridgeStreamResponse(
   bridgeKey: string,
   convKey: string,
   streamIdleTimeoutMs = PROXY_STREAM_IDLE_TIMEOUT_MS,
+  armIdleOnStart = false,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1720,6 +1733,8 @@ function createBridgeStreamResponse(
         },
       );
 
+      if (armIdleOnStart) armStreamIdleTimer();
+
       bridge.onData(processChunk);
 
       bridge.onClose(() => {
@@ -1819,6 +1834,7 @@ export function __testEmitToolCallsFromConnectFrames(frames: Uint8Array[]): stri
 export async function __testStreamToolCallsFromConnectFrames(
   frames: Uint8Array[],
   streamIdleTimeoutMs = PROXY_STREAM_IDLE_TIMEOUT_MS,
+  armIdleOnStart = false,
 ): Promise<string> {
   const bridgeCallbacks: {
     data?: (chunk: Buffer) => void;
@@ -1842,6 +1858,7 @@ export async function __testStreamToolCallsFromConnectFrames(
     bridgeKey,
     "test-auto-conversation",
     streamIdleTimeoutMs,
+    armIdleOnStart,
   );
   const reader = response.body!.getReader();
   for (const frame of frames) bridgeCallbacks.data?.(Buffer.from(frame));
@@ -1904,6 +1921,8 @@ function handleToolResultResume(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
     modelId, bridgeKey, convKey,
+    PROXY_STREAM_IDLE_TIMEOUT_MS,
+    true,
   );
 
   // Send mcpResult for each pending exec that has a matching tool result

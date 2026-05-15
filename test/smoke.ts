@@ -435,6 +435,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
       runRequests.length = 0;
+      mcpResultCount = 0;
     },
     getDiscoveryAuthHeaders() {
       return [...discoveryAuthHeaders];
@@ -1085,6 +1086,17 @@ async function testParallelAutoBridgeKeysDoNotCollide(
     undefined,
     "Expected mixed tool results from parallel bridges not to match one bridge",
   );
+  assertEqual(
+    modules.__testFindActiveBridgeKeyByToolCallId(
+      [
+        { key: firstKey, pendingToolCallIds: ["tool-call-a"] },
+        { key: secondKey, pendingToolCallIds: ["tool-call-b"] },
+      ],
+      ["historical-tool-call", "tool-call-a", "tool-call-b"],
+    ),
+    undefined,
+    "Expected historical tool results not to hide mixed pending results from parallel bridges",
+  );
   console.log("[test] Parallel AUTO bridge keys OK");
 }
 
@@ -1245,6 +1257,26 @@ async function testStreamingResponseClosesOnIdleText(
   console.log("[test] idle text stream closure OK");
 }
 
+async function testToolResultResumeClosesWhenCursorStaysSilent(
+  modules: TestModules,
+) {
+  console.log("[test] Testing post-tool-result silent stream closure...");
+  const sseText = await modules.__testStreamToolCallsFromConnectFrames(
+    [],
+    10,
+    true,
+  );
+  assert(
+    sseText.includes('"finish_reason":"stop"'),
+    "Expected silent post-tool-result stream to finish instead of hanging",
+  );
+  assert(
+    sseText.includes("data: [DONE]"),
+    "Expected silent post-tool-result stream to close with [DONE]",
+  );
+  console.log("[test] post-tool-result silent stream closure OK");
+}
+
 async function readSseText(response: Response): Promise<string> {
   const reader = response.body?.getReader();
   assert(reader, "Expected streaming response body");
@@ -1331,6 +1363,181 @@ async function testHttpToolResultResumeContinuesLiveBridge(
 
   modules.stopProxy();
   console.log("[test] HTTP live bridge tool-result resume OK");
+}
+
+async function testCursorAutoSubagentToolResultContinuation(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing cursor/auto subagent tool-result continuation...");
+  backend.resetObservations();
+  backend.queueLiveRunFrames(
+    [makeMcpExecFrame(201, "subagent-tool-1", "call_omo_agent")],
+    [
+      makeTextDeltaFrame("subagent continuation completed"),
+      makeTurnEndedFrame(),
+    ],
+  );
+  const port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  const firstResponse = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "cursor/auto",
+      stream: true,
+      messages: [{ role: "user", content: "run a subagent task" }],
+    }),
+  });
+  assertEqual(firstResponse.status, 200, "Expected initial cursor/auto stream to succeed");
+  const firstSseText = await readSseText(firstResponse);
+  assert(
+    firstSseText.includes('"finish_reason":"tool_calls"'),
+    `Expected initial stream to pause for OpenAI tool_calls, got ${firstSseText}`,
+  );
+  const toolCallId = extractFirstToolCallId(firstSseText);
+  assertEqual(
+    toolCallId,
+    "subagent-tool-1",
+    "Expected OpenAI tool_call_id to preserve Cursor MCP toolCallId",
+  );
+
+  const resumedResponse = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "cursor/auto",
+      stream: true,
+      messages: [
+        { role: "user", content: "run a subagent task" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: toolCallId,
+            type: "function",
+            function: { name: "call_omo_agent", arguments: "{}" },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: toolCallId,
+          content: "subagent result payload",
+        },
+      ],
+    }),
+  });
+  assertEqual(resumedResponse.status, 200, "Expected cursor/auto tool-result resume to succeed");
+  const resumedSseText = await readSseText(resumedResponse);
+  assert(
+    resumedSseText.includes("subagent continuation completed"),
+    `Expected resumed stream to include backend continuation text, got ${resumedSseText}`,
+  );
+  assertEqual(
+    backend.getMcpResultCount(),
+    1,
+    "Expected backend to receive exactly one mcpResult before sending resumed frames",
+  );
+
+  modules.stopProxy();
+  console.log("[test] cursor/auto subagent tool-result continuation OK");
+}
+
+async function testCursorAutoReadFileContinuationIgnoresHistoricalToolResults(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing cursor/auto read_file continuation ignores historical tool results...");
+  backend.resetObservations();
+  backend.queueLiveRunFrames(
+    [makeMcpExecFrame(202, "current-read-file-tool", "read_file")],
+    [
+      makeTextDeltaFrame("continued with historical tool transcript"),
+      makeTurnEndedFrame(),
+    ],
+  );
+  const port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  const firstResponse = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "cursor/auto",
+      stream: true,
+      messages: [{ role: "user", content: "read a file after a previous tool result" }],
+    }),
+  });
+  assertEqual(firstResponse.status, 200, "Expected initial cursor/auto stream to succeed");
+  const firstSseText = await readSseText(firstResponse);
+  const toolCallId = extractFirstToolCallId(firstSseText);
+  assertEqual(
+    toolCallId,
+    "current-read-file-tool",
+    "Expected current tool call id to come from the live Cursor MCP exec",
+  );
+
+  const resumedResponse = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "cursor/auto",
+      stream: true,
+      messages: [
+        { role: "user", content: "previous task" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "old-tool-call",
+            type: "function",
+            function: { name: "read_file", arguments: "{}" },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: "old-tool-call",
+          content: "old tool result",
+        },
+        { role: "user", content: "read a file after a previous tool result" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: toolCallId,
+            type: "function",
+            function: { name: "read_file", arguments: "{}" },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: toolCallId,
+          content: "current file contents",
+        },
+      ],
+    }),
+  });
+  assertEqual(
+    resumedResponse.status,
+    200,
+    "Expected historical tool transcript not to orphan current cursor/auto read_file resume",
+  );
+  const resumedSseText = await readSseText(resumedResponse);
+  assert(
+    resumedSseText.includes("continued with historical tool transcript"),
+    `Expected resumed stream to include continuation text, got ${resumedSseText}`,
+  );
+  assertEqual(
+    backend.getMcpResultCount(),
+    1,
+    "Expected backend to receive exactly one current read_file mcpResult",
+  );
+
+  modules.stopProxy();
+  console.log("[test] cursor/auto historical read_file continuation OK");
 }
 
 async function testExpiredTokenRefreshBeforeDiscovery(
@@ -1497,7 +1704,10 @@ await testToolResultContinuationFallsBackToToolCallId(modules);
     await testStreamingResponseClosesOnConnectError(modules);
     await testStreamingResponseClosesOnTurnEnded(modules);
     await testStreamingResponseClosesOnIdleText(modules);
+    await testToolResultResumeClosesWhenCursorStaysSilent(modules);
     await testHttpToolResultResumeContinuesLiveBridge(modules, backend);
+    await testCursorAutoSubagentToolResultContinuation(modules, backend);
+    await testCursorAutoReadFileContinuationIgnoresHistoricalToolResults(modules, backend);
     await testInteractionQueryIsRejected(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
