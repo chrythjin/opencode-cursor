@@ -29,6 +29,7 @@ interface TestModules {
 __testCreateActiveBridgeKey: typeof import("../src/proxy").__testCreateActiveBridgeKey;
   __testDeriveBridgeKey: typeof import("../src/proxy").__testDeriveBridgeKey;
   __testBuildPayloadFromOpenAiMessages: typeof import("../src/proxy").__testBuildPayloadFromOpenAiMessages;
+  __testToolResultResumeWritesAfterDataHandlerAttached: typeof import("../src/proxy").__testToolResultResumeWritesAfterDataHandlerAttached;
   __testEmitToolCallsFromConnectFrames: typeof import("../src/proxy").__testEmitToolCallsFromConnectFrames;
   __testStreamToolCallsFromConnectFrames: typeof import("../src/proxy").__testStreamToolCallsFromConnectFrames;
   __testInteractionResponseFromQueryFrame: typeof import("../src/proxy").__testInteractionResponseFromQueryFrame;
@@ -53,6 +54,7 @@ interface TestCursorBackend {
   apiUrl: string;
   refreshUrl: string;
   queueRunFrames: (frames: Uint8Array[]) => void;
+  queueLiveRunFrames: (initialFrames: Uint8Array[], resumedFrames: Uint8Array[]) => void;
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
   resetObservations: () => void;
@@ -60,6 +62,7 @@ interface TestCursorBackend {
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
   getRunRequests: () => ObservedRunRequest[];
+  getMcpResultCount: () => number;
   close: () => Promise<void>;
 }
 
@@ -251,6 +254,16 @@ function observeRunRequest(body: Uint8Array): ObservedRunRequest | null {
   };
 }
 
+function countMcpResultMessages(body: Uint8Array): number {
+  let count = 0;
+  for (const messageBytes of decodeConnectStreamingMessages(body)) {
+    const clientMessage = fromBinary(AgentClientMessageSchema, messageBytes);
+    if (clientMessage.message.case !== "execClientMessage") continue;
+    if (clientMessage.message.value.message.case === "mcpResult") count++;
+  }
+  return count;
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
@@ -261,6 +274,8 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const refreshAuthHeaders: string[] = [];
   const runRequests: ObservedRunRequest[] = [];
   const queuedRunFrames: Uint8Array[][] = [];
+  const queuedLiveRunFrames: Array<{ initialFrames: Uint8Array[]; resumedFrames: Uint8Array[] }> = [];
+  let mcpResultCount = 0;
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
       res.writeHead(404);
@@ -294,15 +309,44 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     const path = String(headers[":path"] ?? "");
     const authHeader = String(headers.authorization ?? "");
     const chunks: Buffer[] = [];
+    const liveFrames = path === "/agent.v1.AgentService/Run"
+      ? queuedLiveRunFrames.shift()
+      : undefined;
+    let liveResponded = false;
+    let liveResumed = false;
 
     stream.on("data", (chunk) => {
-      chunks.push(Buffer.from(chunk));
+      const buffer = Buffer.from(chunk);
+      chunks.push(buffer);
+      if (!liveFrames) return;
+      if (!liveResponded) {
+        liveResponded = true;
+        try {
+          serverStream.respond({
+            ":status": 200,
+            "content-type": "application/connect+proto",
+          });
+          for (const frame of liveFrames.initialFrames) stream.write(frame);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ERR_HTTP2_INVALID_STREAM") {
+            throw error;
+          }
+        }
+        return;
+      }
+      mcpResultCount += countMcpResultMessages(new Uint8Array(buffer));
+      if (mcpResultCount > 0 && !liveResumed) {
+        liveResumed = true;
+        for (const frame of liveFrames.resumedFrames) stream.write(frame);
+        stream.end();
+      }
     });
 
     stream.on("end", () => {
       if (path === "/agent.v1.AgentService/Run") {
         const observed = observeRunRequest(new Uint8Array(Buffer.concat(chunks)));
         if (observed) runRequests.push(observed);
+        if (liveFrames) return;
         if (!stream.destroyed) {
           try {
             serverStream.respond({
@@ -377,6 +421,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     queueRunFrames(frames) {
       queuedRunFrames.push(frames);
     },
+    queueLiveRunFrames(initialFrames, resumedFrames) {
+      queuedLiveRunFrames.push({ initialFrames, resumedFrames });
+    },
     setDiscoveryMode(mode) {
       discoveryMode = mode;
     },
@@ -400,6 +447,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     },
     getRunRequests() {
       return [...runRequests];
+    },
+    getMcpResultCount() {
+      return mcpResultCount;
     },
     async close() {
       await Promise.all([
@@ -427,6 +477,7 @@ __testFindActiveBridgeKeyByToolCallId: proxy.__testFindActiveBridgeKeyByToolCall
     __testCreateActiveBridgeKey: proxy.__testCreateActiveBridgeKey,
     __testDeriveBridgeKey: proxy.__testDeriveBridgeKey,
     __testBuildPayloadFromOpenAiMessages: proxy.__testBuildPayloadFromOpenAiMessages,
+    __testToolResultResumeWritesAfterDataHandlerAttached: proxy.__testToolResultResumeWritesAfterDataHandlerAttached,
     __testEmitToolCallsFromConnectFrames: proxy.__testEmitToolCallsFromConnectFrames,
     __testStreamToolCallsFromConnectFrames: proxy.__testStreamToolCallsFromConnectFrames,
     __testInteractionResponseFromQueryFrame: proxy.__testInteractionResponseFromQueryFrame,
@@ -984,6 +1035,14 @@ async function testDeriveBridgeKeySkipsToolRoleMessages(
   console.log("[test] deriveBridgeKey skips tool-role messages OK");
 }
 
+function testToolResultResumeAttachesDataHandlerBeforeWrite(modules: TestModules) {
+  assert(
+    modules.__testToolResultResumeWritesAfterDataHandlerAttached(),
+    "Expected tool-result resume to attach the bridge data handler before writing mcpResult",
+  );
+  console.log("[test] tool-result resume handler attachment order OK");
+}
+
 async function testParallelAutoBridgeKeysDoNotCollide(
   modules: TestModules,
 ) {
@@ -1156,6 +1215,94 @@ async function testStreamingResponseClosesOnIdleText(
   console.log("[test] idle text stream closure OK");
 }
 
+async function readSseText(response: Response): Promise<string> {
+  const reader = response.body?.getReader();
+  assert(reader, "Expected streaming response body");
+  const decoder = new TextDecoder();
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  text += decoder.decode();
+  return text;
+}
+
+function extractFirstToolCallId(sseText: string): string {
+  const match = sseText.match(/"tool_calls":\[\{[^\n]*"id":"([^"]+)"/);
+  assert(match?.[1], `Expected SSE tool_calls with id, got ${sseText}`);
+  return match[1];
+}
+
+async function testHttpToolResultResumeContinuesLiveBridge(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing HTTP tool-result resume on live bridge...");
+  backend.resetObservations();
+  backend.queueLiveRunFrames(
+    [makeMcpExecFrame(101, "tool-call-live", "read_file")],
+    [makeTextDeltaFrame("resumed after tool result"), makeTurnEndedFrame()],
+  );
+  const port = await modules.startProxy(async () => "test-token", [
+    { id: "composer-2", name: "Composer 2" },
+  ]);
+
+  const firstResponse = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "auto",
+      stream: true,
+      messages: [{ role: "user", content: "live bridge resume prompt" }],
+    }),
+  });
+  assertEqual(firstResponse.status, 200, "Expected first streaming tool-call response to succeed");
+  const firstSseText = await readSseText(firstResponse);
+  assert(
+    firstSseText.includes('"finish_reason":"tool_calls"'),
+    "Expected first response to stop for tool_calls",
+  );
+  const toolCallId = extractFirstToolCallId(firstSseText);
+
+  const resumedResponse = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "auto",
+      stream: true,
+      messages: [
+        { role: "user", content: "live bridge resume prompt" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: toolCallId,
+            type: "function",
+            function: { name: "read_file", arguments: "{}" },
+          }],
+        },
+        { role: "tool", tool_call_id: toolCallId, content: "file contents" },
+      ],
+    }),
+  });
+  assertEqual(resumedResponse.status, 200, "Expected live bridge resume response to succeed");
+  const resumedSseText = await readSseText(resumedResponse);
+  assert(
+    resumedSseText.includes("resumed after tool result"),
+    `Expected resumed SSE text from the original live bridge, got ${resumedSseText}`,
+  );
+  assertEqual(
+    backend.getMcpResultCount(),
+    1,
+    "Expected the test Cursor backend to observe exactly one mcpResult on the live stream",
+  );
+
+  modules.stopProxy();
+  console.log("[test] HTTP live bridge tool-result resume OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -1313,11 +1460,13 @@ async function main() {
     await testFollowUpIgnoresStoredCheckpoint(modules);
 await testToolResultContinuationFallsBackToToolCallId(modules);
     await testDeriveBridgeKeySkipsToolRoleMessages(modules);
+    testToolResultResumeAttachesDataHandlerBeforeWrite(modules);
     await testParallelAutoBridgeKeysDoNotCollide(modules);
     await testStreamingResponseEmitsAllMcpArgs(modules);
     await testStreamingResponseClosesOnConnectError(modules);
     await testStreamingResponseClosesOnTurnEnded(modules);
     await testStreamingResponseClosesOnIdleText(modules);
+    await testHttpToolResultResumeContinuesLiveBridge(modules, backend);
     await testInteractionQueryIsRejected(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);

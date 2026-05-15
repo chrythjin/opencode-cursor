@@ -685,6 +685,47 @@ export function __testBuildPayloadFromOpenAiMessages(
   ).requestBytes;
 }
 
+export function __testToolResultResumeWritesAfterDataHandlerAttached(): boolean {
+  let dataHandlerAttached = false;
+  const writeStates: boolean[] = [];
+  const bridge = {
+    write: (_data: Uint8Array) => {
+      writeStates.push(dataHandlerAttached);
+    },
+    end: () => {},
+    onData: (_cb: (chunk: Buffer) => void) => {
+      dataHandlerAttached = true;
+    },
+    onClose: (_cb: (code: number) => void) => {},
+    get alive() { return true; },
+  };
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  try {
+    handleToolResultResume(
+      {
+        bridge,
+        heartbeatTimer,
+        blobStore: new Map(),
+        mcpTools: [],
+        pendingExecs: [{
+          execId: "exec-1",
+          execMsgId: 1,
+          toolCallId: "tool-call-1",
+          toolName: "test_tool",
+          decodedArgs: "{}",
+        }],
+      },
+      [{ toolCallId: "tool-call-1", content: "tool result" }],
+      "auto",
+      createActiveBridgeKey("test-resume-order"),
+      "test-conversation",
+    );
+    return writeStates.length > 0 && writeStates.every(Boolean);
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
+}
+
 interface ToolResultInfo {
   toolCallId: string;
   content: string;
@@ -1838,6 +1879,12 @@ function handleToolResultResume(
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
 
+  const response = createBridgeStreamResponse(
+    bridge, heartbeatTimer,
+    blobStore, mcpTools,
+    modelId, bridgeKey, convKey,
+  );
+
   // Send mcpResult for each pending exec that has a matching tool result
   for (const exec of pendingExecs) {
     const result = toolResults.find(
@@ -1885,11 +1932,7 @@ function handleToolResultResume(
     );
   }
 
-  return createBridgeStreamResponse(
-    bridge, heartbeatTimer,
-    blobStore, mcpTools,
-    modelId, bridgeKey, convKey,
-  );
+  return response;
 }
 
 async function handleNonStreamingResponse(
